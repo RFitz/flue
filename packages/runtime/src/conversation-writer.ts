@@ -52,6 +52,7 @@ export class ConversationRecordWriter {
 	private flushing: Promise<{ offset: string }> | undefined;
 	private resolvePending: ((result: { offset: string }) => void) | undefined;
 	private rejectPending: ((error: unknown) => void) | undefined;
+	private lastFlushStartedAt = 0;
 
 	private readonly foldHost: ConversationFoldHost;
 	private batchesSinceFoldCheckpoint = 0;
@@ -167,9 +168,17 @@ export class ConversationRecordWriter {
 				this.resolvePending = resolve;
 				this.rejectPending = reject;
 			});
-			this.pendingTimer ??= setTimeout(() => {
-				void this.flush().catch(() => {});
-			}, CANONICAL_FLUSH_DELAY_MS);
+			if (this.pendingTimer === undefined) {
+				if (Date.now() - this.lastFlushStartedAt >= CANONICAL_FLUSH_DELAY_MS) {
+					queueMicrotask(() => {
+						void this.flush().catch(() => {});
+					});
+				} else {
+					this.pendingTimer = setTimeout(() => {
+						void this.flush().catch(() => {});
+					}, CANONICAL_FLUSH_DELAY_MS);
+				}
+			}
 			return this.pendingFlush;
 		} catch (error) {
 			return Promise.reject(error);
@@ -190,6 +199,7 @@ export class ConversationRecordWriter {
 					offset: this.reducedState?.recordsThroughOffset ?? this.claim.offset,
 				});
 			}
+			this.lastFlushStartedAt = Date.now();
 			const records = this.pendingRecords;
 			const options = this.pendingOptions ?? {};
 			const resolve = this.resolvePending;

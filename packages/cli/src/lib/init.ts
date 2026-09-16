@@ -240,7 +240,7 @@ function renderWrangler(opts: InitPlanOptions): string {
 		`{`,
 		`\t"$schema": "./node_modules/wrangler/config-schema.json",`,
 		`\t"name": "${projectNameFrom(opts.targetDir)}",`,
-		`\t"compatibility_date": "2026-06-01",`,
+		`\t"compatibility_date": "2026-09-01",`,
 		`\t"compatibility_flags": ["nodejs_compat"],`,
 		`\t// Workers Traces shows each agent response as a trace with agent-level`,
 		`\t// spans: https://flueframework.com/docs/guide/observability/#cloudflare`,

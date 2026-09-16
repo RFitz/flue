@@ -263,6 +263,12 @@ export interface Sandbox {
 			cwd?: string;
 			env?: Record<string, string>;
 			/**
+			 * Observe stdout and stderr chunks while the command runs. Chunk
+			 * boundaries are provider-defined and do not necessarily align with
+			 * lines. The resolved ShellResult still contains the complete output.
+			 */
+			onOutput?: (stream: 'stdout' | 'stderr', data: string) => void;
+			/**
 			 * Wall-clock deadline hint in milliseconds. Forwarded to the
 			 * underlying sandbox adapter's native timeout option (E2B
 			 * `timeoutMs`, Daytona `timeout`, etc.) so signal-blind providers

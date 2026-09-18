@@ -79,6 +79,7 @@ The directive is a build-time contract. Outside a built application, [`start()`]
 interface AgentStatics {
   agentName?: string;
   initialData?: v.GenericSchema;
+  locationHint?: AgentLocationHint;
   durability?: DurabilityConfig;
 }
 ```
@@ -91,11 +92,13 @@ export function IssueTriage() {
 }
 IssueTriage.agentName = 'issue-triage';
 IssueTriage.initialData = v.object({ issue: v.pipe(v.number(), v.integer()) });
+IssueTriage.locationHint = 'enam';
 IssueTriage.durability = { maxAttempts: 5, timeoutMs: 7_200_000 };
 ```
 
 - `agentName` — the durable identity override. Assign it to decouple storage identity from the source-level function name (renaming the function then needs no data migration). Must match `AGENT_IDENTITY_PATTERN`; an invalid value throws when the identity is resolved. In a `'use agent'` module the value must be a **string literal** — build targets derive durable identifiers from it before any user code runs.
 - `initialData` — a [Valibot](https://valibot.dev) schema for instance-creation data. Validated exactly once, at the instance's first contact, synchronously before anything durable is admitted; a mismatch — including absence, unless the schema accepts `undefined` — rejects the creating send. The schema-parsed output is what gets recorded and what [`useInitialData()`](/docs/reference/agent-hooks-api/#useinitialdata) returns. Without a schema, whatever the creator sent is recorded untyped.
+- `locationHint` — asks Cloudflare to create new Durable Object instances of this agent near the named area. It is best effort, affects only instances that do not exist yet, and is ignored on other targets. See [Agent location hints](/docs/guide/cloudflare-target/#agent-location-hints).
 - `durability` — the submission retry policy (below). A static rather than a hook because the platform applies it while the function is _not_ running, including after a crash in the agent's own render. Unlike `agentName`, the value need not be a literal — express environment-dependent policy in the assigned expression: `Fn.durability = process.env.CI ? { timeoutMs: 60_000 } : { timeoutMs: 3_600_000 }`.
 
 ## `DurabilityConfig`

@@ -72,7 +72,7 @@ export function generateCloudflareEntry(options: GenerateCloudflareEntryOptions)
 	const agentIdentityEntries = agents
 		.map(
 			(agent) =>
-				`\t${JSON.stringify(agent.identity)}: { bindingName: ${JSON.stringify(agent.bindingName)}, className: ${JSON.stringify(agent.className)} },`,
+				`\t${JSON.stringify(agent.identity)}: { bindingName: ${JSON.stringify(agent.bindingName)}, className: ${JSON.stringify(agent.className)}, locationHint: resolveAgentLocationHint(${agentAccess(agent)}) },`,
 		)
 		.join('\n');
 
@@ -119,6 +119,7 @@ import {
 import {
 	createCloudflareWorkerConfig,
 	createFlueAgentClass,${includeTracing ? '\n\tinstallDefaultCloudflareTracing,' : ''}
+	resolveAgentLocationHint,
 	runWithCloudflareContext,
 } from '@flue/runtime/cloudflare/internal';
 ${
@@ -210,8 +211,9 @@ function createAgentContextForRequest({ instance, agentName, request, submission
 	});
 }
 
-async function fetchAgent(binding, instanceId, request) {
-	return (await getAgentByName(binding, instanceId)).fetch(request);
+async function fetchAgent(binding, instanceId, request, locationHint) {
+	const options = locationHint === undefined ? undefined : { locationHint };
+	return (await getAgentByName(binding, instanceId, options)).fetch(request);
 }
 
 function runWithInstanceContext(doInstance, identity, fn) {

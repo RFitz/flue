@@ -18,6 +18,7 @@
 export { runWithCloudflareContext } from './context.ts';
 export type { CreateFlueAgentClassOptions } from './flue-agent-class.ts';
 export { createFlueAgentClass } from './flue-agent-class.ts';
+export { resolveAgentLocationHint } from './location-hint.ts';
 export { installDefaultCloudflareTracing } from './tracing/index.ts';
 export type {
 	CloudflareAgentIdentity,

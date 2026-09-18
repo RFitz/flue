@@ -610,8 +610,31 @@ export interface AgentProps {
  * IssueTriage.agentName = 'issue-triage';
  * IssueTriage.initialData = v.object({ issue: v.pipe(v.number(), v.integer()) });
  * IssueTriage.durability = { maxAttempts: 5, timeoutMs: 7_200_000 };
+ * IssueTriage.locationHint = 'enam';
  * ```
  */
+
+/**
+ * A Cloudflare Durable Object location hint for newly created agent instances.
+ * Cloudflare treats the value as a best-effort latency hint, not a placement or
+ * data-residency guarantee. The open string arm preserves literal completions
+ * while keeping plain function-static assignment ergonomic; the Cloudflare
+ * bootstrap validates the current supported values at startup.
+ */
+export type AgentLocationHint =
+	| 'wnam'
+	| 'enam'
+	| 'sam'
+	| 'weur'
+	| 'eeur'
+	| 'apac'
+	| 'apac-ne'
+	| 'apac-se'
+	| 'oc'
+	| 'afr'
+	| 'me'
+	| (string & {});
+
 export interface AgentStatics {
 	/**
 	 * The agent's durable identity — keys conversation storage everywhere and
@@ -631,6 +654,13 @@ export interface AgentStatics {
 	 * gets recorded and what `useInitialData()` returns.
 	 */
 	initialData?: v.GenericSchema;
+	/**
+	 * Best-effort Cloudflare location hint for newly created Durable Object
+	 * instances of this agent. It does not move existing instances, guarantee a
+	 * region, or provide data-residency constraints. Ignored on non-Cloudflare
+	 * targets.
+	 */
+	locationHint?: AgentLocationHint;
 	/**
 	 * Submission retry policy: how long ({@link DurabilityConfig.timeoutMs})
 	 * and across how many attempts ({@link DurabilityConfig.maxAttempts}) the

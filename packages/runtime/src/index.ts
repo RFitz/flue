@@ -113,6 +113,7 @@ export type {
 	Agent,
 	AgentDispatchRequest,
 	AgentFunction,
+	AgentLocationHint,
 	AgentProps,
 	AgentRuntimeConfig,
 	AgentStatics,

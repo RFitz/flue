@@ -23,6 +23,25 @@ Canonical agent conversation streams, immutable attachments, and accepted submis
 
 Do not hand-author Flue's generated `FLUE_*` bindings in `wrangler.jsonc`. Declare migrations for generated classes, and declare bindings only for application-owned resources such as your own Durable Objects, R2 buckets, Queues, Hyperdrive configs, Browser Rendering bindings, or Send Email bindings.
 
+### Agent location hints
+
+By default, Cloudflare chooses where to create an agent's Durable Object from the request that first addresses that instance. Assign the agent's `locationHint` static to ask Cloudflare to create new instances near a particular area:
+
+```ts
+'use agent';
+
+export function SupportAgent() {
+  return 'Support the user.';
+}
+SupportAgent.locationHint = 'apac';
+```
+
+The supported hints are `wnam`, `enam`, `sam`, `weur`, `eeur`, `apac`, `apac-ne`, `apac-se`, `oc`, `afr`, and `me`. Flue validates the value when the Cloudflare Worker starts and forwards it for every Flue path that can first address an instance, including HTTP routes, dispatch, and `getAgentInstance()`.
+
+A location hint is **best effort**. It asks Cloudflare to minimize latency from the hinted area; it does not guarantee a region or provide data-residency constraints. Cloudflare only consults the hint when the Durable Object is first created, so changing it does not move existing agent instances. Some hints may currently select a nearby supported location rather than one inside the named area. See Cloudflare's [Durable Object data location documentation](https://developers.cloudflare.com/durable-objects/reference/data-location/) for current behavior.
+
+The static is ignored by Node deployments. Code that directly accesses a generated `FLUE_*` Durable Object namespace bypasses Flue's router and must pass its own location options. Cloudflare `jurisdiction` is intentionally not part of this setting: unlike a latency hint, jurisdiction constrains where an object runs and changes the ID namespace, so it requires separate migration semantics.
+
 ## `wrangler.jsonc`
 
 Your project's `wrangler.jsonc` at the project root configures your Worker's name, compatibility settings, and Durable Object migrations. Flue reads this file, merges its contributions (`main` and the per-agent Durable Object bindings) into a generated `.flue-vite.wrangler.jsonc` that the Cloudflare Vite plugin consumes, and never modifies your authored file. Add `.flue-vite/` and `.flue-vite.wrangler.jsonc` to `.gitignore`.

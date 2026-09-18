@@ -18,7 +18,7 @@ import {
 } from '../errors.ts';
 import type { DispatchInput, DispatchQueue } from '../runtime/dispatch-queue.ts';
 import type { CloudflareRuntime } from '../runtime/flue-app.ts';
-import type { DispatchReceipt } from '../types.ts';
+import type { AgentLocationHint, DispatchReceipt } from '../types.ts';
 import {
 	CLOUDFLARE_AGENT_INTERNAL_DISPATCH_PATH,
 	CLOUDFLARE_AGENT_INTERNAL_INSTANCE_INFO_PATH,
@@ -28,6 +28,8 @@ import {
 export interface CloudflareAgentIdentity {
 	readonly bindingName: string;
 	readonly className: string;
+	/** Best-effort location hint for newly created instances of this agent. */
+	readonly locationHint?: AgentLocationHint;
 }
 
 export interface CreateCloudflareWorkerConfigOptions {
@@ -40,7 +42,12 @@ export interface CreateCloudflareWorkerConfigOptions {
 	/** Agent identity → Durable Object binding, from the build-time scan. */
 	agentIdentities: Record<string, CloudflareAgentIdentity>;
 	/** Route one request to the named instance of an agent DO binding. */
-	fetchAgent: (binding: unknown, instanceId: string, request: Request) => Promise<Response>;
+	fetchAgent: (
+		binding: unknown,
+		instanceId: string,
+		request: Request,
+		locationHint?: AgentLocationHint,
+	) => Promise<Response>;
 }
 
 /** The Cloudflare-target seams the generated entry passes to `configureFlueRuntime`. */
@@ -54,28 +61,36 @@ export function createCloudflareWorkerConfig(
 ): CloudflareWorkerConfig {
 	const { env, agentIdentities, fetchAgent } = options;
 
-	const lookupBinding = (agentName: string, bindingEnv: unknown): unknown => {
+	const lookupAgent = (
+		agentName: string,
+		bindingEnv: unknown,
+	): { binding: unknown; identity: CloudflareAgentIdentity } | undefined => {
 		const identity = agentIdentities[agentName];
 		if (!identity) return undefined;
-		return (bindingEnv as Record<string, unknown> | null | undefined)?.[identity.bindingName];
+		const binding = (bindingEnv as Record<string, unknown> | null | undefined)?.[
+			identity.bindingName
+		];
+		if (!binding) return undefined;
+		return { binding, identity };
 	};
 
 	const dispatchQueue: DispatchQueue = {
 		async enqueue(input: DispatchInput): Promise<DispatchReceipt> {
-			const binding = lookupBinding(input.agent, env);
-			if (!binding) {
+			const resolved = lookupAgent(input.agent, env);
+			if (!resolved) {
 				throw new Error(
 					`[flue] dispatch() target agent "${input.agent}" Durable Object binding is unavailable.`,
 				);
 			}
 			const response = await fetchAgent(
-				binding,
+				resolved.binding,
 				input.id,
 				new Request(`https://flue.invalid${CLOUDFLARE_AGENT_INTERNAL_DISPATCH_PATH}`, {
 					method: 'POST',
 					headers: { 'content-type': 'application/json' },
 					body: JSON.stringify(input),
 				}),
+				resolved.identity.locationHint,
 			);
 			if (!response.ok) {
 				let rejection: unknown;
@@ -96,24 +111,25 @@ export function createCloudflareWorkerConfig(
 		// Handler-context callers forward their per-request env; contexts with
 		// none (cron, queues, Workflow steps, the agent client) fall back to
 		// the worker's module-scope env.
-		const binding = lookupBinding(target.agentName, reqEnv ?? env);
-		if (!binding) return null;
-		return fetchAgent(binding, target.instanceId, request);
+		const resolved = lookupAgent(target.agentName, reqEnv ?? env);
+		if (!resolved) return null;
+		return fetchAgent(resolved.binding, target.instanceId, request, resolved.identity.locationHint);
 	};
 
 	const instanceInfo: CloudflareRuntime['instanceInfo'] = async (agentName, instanceId) => {
-		const binding = lookupBinding(agentName, env);
-		if (!binding) {
+		const resolved = lookupAgent(agentName, env);
+		if (!resolved) {
 			throw new Error(
 				`[flue] getAgentInstance() target agent "${agentName}" Durable Object binding is unavailable.`,
 			);
 		}
 		const response = await fetchAgent(
-			binding,
+			resolved.binding,
 			instanceId,
 			new Request(`https://flue.invalid${CLOUDFLARE_AGENT_INTERNAL_INSTANCE_INFO_PATH}`, {
 				method: 'GET',
 			}),
+			resolved.identity.locationHint,
 		);
 		if (!response.ok) {
 			throw new Error(

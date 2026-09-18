@@ -108,6 +108,7 @@ export {
 	sandboxFromDriver,
 } from './sandbox.ts';
 export { defineSkill } from './skill-definition.ts';
+export { ToolTimeoutError } from './abort.ts';
 export { defineTool } from './tool.ts';
 export type {
 	Agent,

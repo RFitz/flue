@@ -1217,6 +1217,13 @@ type FlueEventVariant =
 	  }
 	| { type: 'tool_start'; toolName: string; toolCallId: string; args?: any }
 	| {
+			/** Live progress snapshot from a running tool. Never persisted or replayed. */
+			type: 'tool_update';
+			toolName: string;
+			toolCallId: string;
+			result: unknown;
+	  }
+	| {
 			type: 'tool';
 			toolName: string;
 			toolCallId: string;

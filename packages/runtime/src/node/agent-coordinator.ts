@@ -1,6 +1,8 @@
 import { SUBMISSION_HARNESS_NAME, SUBMISSION_SESSION_NAME } from '../adapter-helpers.ts';
 import type { AgentSubmission, AgentSubmissionStore } from '../agent-execution-store.ts';
 import { LEASE_DURATION_MS } from '../agent-execution-store.ts';
+import { getConversationFoldHost } from '../conversation-fold-host.ts';
+import type { ReducedInstanceState } from '../conversation-reducer.ts';
 import { ConversationRecordWriter } from '../conversation-writer.ts';
 import {
 	classifyError,
@@ -19,6 +21,7 @@ import {
 	createDispatchAgentSubmissionInput,
 	ensureInstanceIdentity,
 	finalizePendingSettlement,
+	findInstanceIdentity,
 	type InstanceContactAdmission,
 	type InstanceIdentity,
 	isInstanceContactRejection,
@@ -141,7 +144,6 @@ export function createNodeAgentCoordinator(options: {
 		activityGate,
 	} = options;
 	const coordinatorEnv = options.env ?? {};
-	const conversationWriters = new Map<string, Promise<ConversationRecordWriter>>();
 	const conversationMaterializations = new Map<string, Promise<unknown>>();
 	// Live MCP connections, keyed per instance stream path like the writers
 	// above: submissions reuse an instance's connections for the process
@@ -188,7 +190,10 @@ export function createNodeAgentCoordinator(options: {
 	// ── Concurrent claim loop state ──────────────────────────────────────
 
 	/** Submissions currently being processed, keyed by submissionId. */
-	const activeSubmissions = new Map<string, { task: Promise<void>; abort: AbortController }>();
+	const activeSubmissions = new Map<
+		string,
+		{ task: Promise<void>; abort: AbortController; writer?: ConversationRecordWriter }
+	>();
 
 	/**
 	 * Wake signal. The claim loop sleeps on `wakePromise` when there is
@@ -240,28 +245,83 @@ export function createNodeAgentCoordinator(options: {
 
 	// ── Helpers ──────────────────────────────────────────────────────────
 
-	function getConversationWriter(
+	/**
+	 * Take the conversation stream's producer for one unit of work and return
+	 * a writer holding it. Every caller owns the work it acquires for: a
+	 * claimed or replacement attempt, a recovery settle over an expired lease,
+	 * or an unborn instance's birth record. The acquire bumps the producer
+	 * epoch, so the epoch is the fencing token for that unit of work: any
+	 * writer acquired earlier, in this process or another, fails its next
+	 * append. Never cache the result across units of work — another process
+	 * may take the producer in between (#705). Release it when the work ends.
+	 */
+	async function acquireConversationWriter(
 		input: AgentSubmissionInput,
 	): Promise<ConversationRecordWriter | undefined> {
-		if (!conversationStreamStore) return Promise.resolve(undefined);
-		const path = agentStreamPath(input.agent, input.id);
-		let writer = conversationWriters.get(path);
-		if (!writer) {
-			writer = ConversationRecordWriter.create({
-				store: conversationStreamStore,
-				path,
-				identity: { agentName: input.agent, instanceId: input.id },
-				producerId: ownerId,
-				onFailed: () => {
-					if (conversationWriters.get(path) === writer) conversationWriters.delete(path);
-				},
-			});
-			conversationWriters.set(path, writer);
-			void writer.catch(() => {
-				if (conversationWriters.get(path) === writer) conversationWriters.delete(path);
-			});
+		if (!conversationStreamStore) return undefined;
+		return ConversationRecordWriter.create({
+			store: conversationStreamStore,
+			path: agentStreamPath(input.agent, input.id),
+			identity: { agentName: input.agent, instanceId: input.id },
+			producerId: ownerId,
+		});
+	}
+
+	/**
+	 * The conversation's folded state at the durable head, read without
+	 * taking the producer — admission reads from any process while another
+	 * process's attempt owns the stream.
+	 */
+	async function readConversationState(
+		input: AgentSubmissionInput,
+	): Promise<ReducedInstanceState | undefined> {
+		if (!conversationStreamStore) return undefined;
+		return getConversationFoldHost(
+			conversationStreamStore,
+			agentStreamPath(input.agent, input.id),
+		).getStateAtHead();
+	}
+
+	/**
+	 * Find the instance's birth record, creating it only when the instance is
+	 * unborn. Only a creation acquires the producer; an existing instance may
+	 * have a live attempt in another process, which an acquire would fence
+	 * out. Two processes creating the same instance race on the producer:
+	 * the loser's append fails as stale, and it adopts the winner's record.
+	 */
+	async function ensureConversationIdentity(
+		input: AgentSubmissionInput,
+		agent: Agent,
+	): Promise<InstanceIdentity | undefined> {
+		const state = await readConversationState(input);
+		if (!state) return undefined;
+		const existing = findInstanceIdentity(state);
+		if (existing) return existing;
+		const writer = await acquireConversationWriter(input);
+		if (!writer) return undefined;
+		try {
+			return await ensureInstanceIdentity(writer, agent, input.initialData);
+		} catch (error) {
+			const raced = await readConversationState(input);
+			const adopted = raced && findInstanceIdentity(raced);
+			if (adopted) return adopted;
+			throw error;
+		} finally {
+			writer.release();
 		}
-		return writer;
+	}
+
+	/** Run `work` with a writer acquired for it, releasing the writer after. */
+	async function withConversationWriter<T>(
+		input: AgentSubmissionInput,
+		work: (writer: ConversationRecordWriter | undefined) => Promise<T>,
+	): Promise<T> {
+		const writer = await acquireConversationWriter(input);
+		try {
+			return await work(writer);
+		} finally {
+			writer?.release();
+		}
 	}
 
 	function getMcpConnections(input: AgentSubmissionInput): McpConnectionCache {
@@ -307,9 +367,8 @@ export function createNodeAgentCoordinator(options: {
 		const path = agentStreamPath(input.agent, input.id);
 		const previous = conversationMaterializations.get(path) ?? Promise.resolve();
 		const materialized = previous.then(async () => {
-			const writer = await getConversationWriter(input);
-			if (!writer) return undefined;
-			const identity = await ensureInstanceIdentity(writer, agent, input.initialData);
+			const identity = await ensureConversationIdentity(input, agent);
+			if (!identity) return undefined;
 			await materializeSubmissionAttachments(input, identity.conversationId, attachmentStore);
 			return identity;
 		});
@@ -345,8 +404,16 @@ export function createNodeAgentCoordinator(options: {
 	function spawnSubmissionTask(claimed: AgentSubmission): void {
 		const controller = new AbortController();
 		const emitCoordinatorEvent = coordinatorEventEmitter(claimed.input);
+		const entry: {
+			task: Promise<void>;
+			abort: AbortController;
+			writer?: ConversationRecordWriter;
+		} = { task: Promise.resolve(), abort: controller };
 		const task = (async () => {
-			const conversationWriter = await getConversationWriter(claimed.input);
+			// Acquired after the claim CAS, so this attempt's producer epoch
+			// fences every earlier writer for the conversation.
+			const conversationWriter = await acquireConversationWriter(claimed.input);
+			entry.writer = conversationWriter;
 			return processSubmission({
 				submissions,
 				submission: claimed,
@@ -388,10 +455,14 @@ export function createNodeAgentCoordinator(options: {
 				);
 			})
 			.finally(() => {
-				activeSubmissions.delete(claimed.submissionId);
+				entry.writer?.release();
+				if (activeSubmissions.get(claimed.submissionId) === entry) {
+					activeSubmissions.delete(claimed.submissionId);
+				}
 				wake();
 			});
-		activeSubmissions.set(claimed.submissionId, { task, abort: controller });
+		entry.task = task;
+		activeSubmissions.set(claimed.submissionId, entry);
 	}
 
 	// ── Claim loop ───────────────────────────────────────────────────────
@@ -660,24 +731,24 @@ export function createNodeAgentCoordinator(options: {
 				reason: abortRequested ? 'abort_unhonored' : 'exceeded_timeout',
 			});
 			try {
-				const conversationWriter = await getConversationWriter(submission.input);
-				await reconcileInterruptedSubmission(
-					submissions,
-					submission,
-					agent,
-					makeSubmissionContext(submission.input, conversationWriter),
-					{ ownerId, leaseExpiresAt: Date.now() + LEASE_DURATION_MS },
-					conversationWriter,
-					coordinatorEventEmitter(submission.input),
+				// A fresh producer fences the hung task's writer out of the stream
+				// before the settle runs over it.
+				await withConversationWriter(submission.input, (conversationWriter) =>
+					reconcileInterruptedSubmission(
+						submissions,
+						submission,
+						agent,
+						makeSubmissionContext(submission.input, conversationWriter),
+						{ ownerId, leaseExpiresAt: Date.now() + LEASE_DURATION_MS },
+						conversationWriter,
+						coordinatorEventEmitter(submission.input),
+					),
 				);
 				// Orphan the zombie: drop its active entry so idleness and the
 				// claim loop key on the settled row (its own finally-cleanup is
-				// unreachable), and rotate the cached conversation writer so
-				// later sessions acquire a fresh producer — a waking zombie's
-				// rejected append then fails only the stale writer object it
-				// holds, never a successor's.
+				// unreachable), and release its writer's fold-host pin.
 				activeSubmissions.delete(submissionId);
-				conversationWriters.delete(agentStreamPath(submission.input.agent, submission.input.id));
+				active.writer?.release();
 			} catch (error) {
 				coordinatorEventEmitter(submission.input)(
 					{
@@ -841,14 +912,15 @@ export function createNodeAgentCoordinator(options: {
 				) {
 					continue;
 				}
-				const writer = await getConversationWriter(submission.input);
-				if (!writer) continue;
-				await finalizePendingSettlement(
-					submissions,
-					writer,
-					settlement,
-					coordinatorEventEmitter(submission.input),
-				);
+				await withConversationWriter(submission.input, async (writer) => {
+					if (!writer) return;
+					await finalizePendingSettlement(
+						submissions,
+						writer,
+						settlement,
+						coordinatorEventEmitter(submission.input),
+					);
+				});
 			} catch (error) {
 				console.error(
 					'[flue:submission-reconciliation]',
@@ -901,15 +973,16 @@ export function createNodeAgentCoordinator(options: {
 				continue;
 			}
 			try {
-				const conversationWriter = await getConversationWriter(submission.input);
-				const replacement = await reconcileInterruptedSubmission(
-					submissions,
-					submission,
-					agent,
-					makeSubmissionContext(submission.input, conversationWriter),
-					{ ownerId, leaseExpiresAt: Date.now() + LEASE_DURATION_MS },
-					conversationWriter,
-					coordinatorEventEmitter(submission.input),
+				const replacement = await withConversationWriter(submission.input, (conversationWriter) =>
+					reconcileInterruptedSubmission(
+						submissions,
+						submission,
+						agent,
+						makeSubmissionContext(submission.input, conversationWriter),
+						{ ownerId, leaseExpiresAt: Date.now() + LEASE_DURATION_MS },
+						conversationWriter,
+						coordinatorEventEmitter(submission.input),
+					),
 				);
 				if (replacement) {
 					spawnSubmissionTask(replacement);
@@ -975,10 +1048,7 @@ export function createNodeAgentCoordinator(options: {
 
 				const submissionInput = createDispatchAgentSubmissionInput(input);
 				const keyed = isKeyDerivedSubmissionId(input.submissionId);
-				const loadReducedState = async () => {
-					const writer = await getConversationWriter(submissionInput);
-					return writer?.loadReducedState();
-				};
+				const loadReducedState = () => readConversationState(submissionInput);
 				let contact: InstanceContactAdmission;
 				try {
 					contact = await admitInstanceContact({
@@ -1136,10 +1206,7 @@ export function createNodeAgentCoordinator(options: {
 						...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
 					});
 					const keyed = idempotencyKey !== undefined;
-					const loadReducedState = async () => {
-						const writer = await getConversationWriter(input);
-						return writer?.loadReducedState();
-					};
+					const loadReducedState = () => readConversationState(input);
 					// A deduplicated replay re-attaches from the stream origin: the
 					// original admission-time offset is not persisted, and settlement
 					// records are observable from the origin indefinitely.
@@ -1210,8 +1277,9 @@ export function createNodeAgentCoordinator(options: {
 							// healthy row, not a lost submission (rows are never deleted).
 							await submissions.markSubmissionCanonicalReady(input.submissionId);
 						}
-						const writer = await getConversationWriter(input);
-						const offset = deduplicated ? '-1' : (writer?.offset ?? '-1');
+						const offset = deduplicated
+							? '-1'
+							: ((await readConversationState(input))?.recordsThroughOffset ?? '-1');
 						// An adopted replay may hold neither the contact uid nor a fresh
 						// identity (its gate ran before the winning admission
 						// materialized) — read the recorded identity back instead.

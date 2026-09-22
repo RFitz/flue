@@ -11,6 +11,7 @@ import { DURABILITY_DEFAULT_TIMEOUT_MS } from '../agent-execution-store.ts';
 import { assertDurability } from '../agent-tuning.ts';
 import { decodeBase64 } from '../base64.ts';
 import type { FlueContextInternal } from '../client.ts';
+import { conversationScopeKey, type ReducedInstanceState } from '../conversation-reducer.ts';
 import type { ConversationRecordWriter } from '../conversation-writer.ts';
 import {
 	AgentInstanceExistsError,
@@ -277,6 +278,23 @@ export interface InstanceIdentity {
 }
 
 /**
+ * The identity on an instance's birth record, read from a folded state, or
+ * `undefined` when the instance is unborn. The read-only half of
+ * {@link ensureInstanceIdentity}: a caller that must not take the stream's
+ * producer (another process may own it) checks here before acquiring one.
+ */
+export function findInstanceIdentity(state: ReducedInstanceState): InstanceIdentity | undefined {
+	const conversationId = state.conversationScopes.get(
+		conversationScopeKey(SUBMISSION_HARNESS_NAME, SUBMISSION_SESSION_NAME),
+	);
+	if (!conversationId || !state.conversations.has(conversationId)) return undefined;
+	if (state.uid === undefined) {
+		throw new Error("[flue] invariant: an existing instance's birth record must carry a uid.");
+	}
+	return { conversationId, uid: state.uid };
+}
+
+/**
  * Idempotent find-or-create of the instance's birth record — the single code
  * path that creates root instance identity. Admission (both coordinators'
  * dispatch/direct paths and their unready-row recovery passes) calls this
@@ -293,14 +311,8 @@ export async function ensureInstanceIdentity(
 	agent: Agent,
 	initialData: unknown,
 ): Promise<InstanceIdentity> {
-	const existing = await writer.findConversation(SUBMISSION_HARNESS_NAME, SUBMISSION_SESSION_NAME);
-	if (existing) {
-		const { uid } = await writer.loadReducedState();
-		if (uid === undefined) {
-			throw new Error("[flue] invariant: an existing instance's birth record must carry a uid.");
-		}
-		return { conversationId: existing.conversationId, uid };
-	}
+	const existing = findInstanceIdentity(await writer.loadReducedState());
+	if (existing) return existing;
 	const data = parseCreationData(agent, initialData);
 	const identity = createConversationIdentity();
 	const uid = generateInstanceUid();

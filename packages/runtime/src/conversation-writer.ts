@@ -296,6 +296,16 @@ export class ConversationRecordWriter {
 		return operation;
 	}
 
+	/**
+	 * Retire the writer once its owner is done with it: unpin the fold host
+	 * and refuse further use. Idempotent. Owners that acquire a writer per
+	 * unit of work (the Node coordinator, per claimed attempt) must release
+	 * it, or the pinned host is never evicted.
+	 */
+	release(): void {
+		this.fail(new Error('[flue] Conversation writer was released by its owner.'));
+	}
+
 	private assertActive(): void {
 		if (this.lifecycle.status === 'failed') throw this.lifecycle.error;
 	}

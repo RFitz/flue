@@ -383,6 +383,11 @@ class PgSubmissionStore implements AgentSubmissionStore {
 		if (listen) {
 			this.subscribeAbortRequests = (listener) => {
 				const listening = listen.call(runner, SUBMISSION_ABORT_CHANNEL, listener);
+				// A failed LISTEN must not surface as an unhandled rejection;
+				// the owner's deadline scan still finds the abort intent.
+				listening.catch((error: unknown) => {
+					console.error('[flue:postgres] Could not listen for abort requests:', error);
+				});
 				return () => {
 					void listening.then((unlisten) => unlisten()).catch(() => {});
 				};

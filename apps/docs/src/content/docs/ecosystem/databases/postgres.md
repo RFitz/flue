@@ -106,9 +106,10 @@ implement this callback transaction contract.
 ### Running more than one process
 
 When several server processes share the database, add an optional `listen` to
-the runner. Flue sends `pg_notify` when a conversation appends and when an
-abort is requested; with `listen`, other processes wake their stream readers
-and stop the aborted work at once. Without it, everything still works, but
+the runner. With it, Flue sends `pg_notify` when a conversation appends and
+when an abort is requested, and other processes wake their stream readers and
+stop the aborted work at once. Give every process the same runner shape: a
+process without `listen` sends no append signals. Without it, everything still works, but
 aborts reach other processes by a one-second poll and stream readers by their
 poll timeouts.
 

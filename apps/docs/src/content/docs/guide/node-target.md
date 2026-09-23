@@ -38,7 +38,7 @@ Without `db.ts`, the Node server uses process-local in-memory SQLite for canonic
 
 With a durable adapter, direct prompts and `dispatch(...)` inputs enter the same persisted per-conversation queue. Inputs for one agent conversation are processed in accepted order, and a replacement process can recover canonical conversation progress and interrupted submissions.
 
-Node requires one live process to own a given agent conversation. A shared database supports process or host replacement, but does not make active-active ownership or round-robin routing for the same conversation safe. Multi-replica deployments must route each conversation to one owner and avoid overlapping owners during replacement.
+Several processes can share one durable database and serve the same conversations, with any routing. Each claimed attempt fences out earlier writers, and a process stops an attempt whose lease another process reclaimed. [Durability](/docs/guide/durability/#nodejs-recovery) covers what leases cannot bound. In-process [schedules](/docs/guide/schedules/) fire in every replica.
 
 Node does not get Cloudflare's automatic Durable Object wake or Fiber recovery. A replacement process must start successfully before startup reconciliation runs, and the coordinator periodically scans expired leases so work stranded by a fast restart is eventually reclaimed.
 

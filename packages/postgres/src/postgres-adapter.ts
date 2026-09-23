@@ -34,6 +34,7 @@ import {
 	PersistedFormatVersionError,
 } from '@flue/runtime/adapter';
 import { PgAttachmentStore } from './postgres-attachment-store.ts';
+import { fitsNotifyPayload, SUBMISSION_ABORT_CHANNEL } from './notify.ts';
 import { createPgConversationStreamStore } from './postgres-conversation-store.ts';
 
 // ─── Bring-your-own-driver runner seam ──────────────────────────────────────
@@ -70,6 +71,19 @@ export interface PostgresRunner {
 	query: PostgresQuery;
 	transaction<T>(fn: (tx: { query: PostgresQuery }) => Promise<T>): Promise<T>;
 	close(): void | Promise<void>;
+	/**
+	 * Optional `LISTEN` on `channel`, calling `onNotify` with each
+	 * notification's payload until the returned function is called or the
+	 * runner closes. Needed only when more than one process serves the same
+	 * database: with it, stream readers and aborts reach other processes at
+	 * once; without it, they wait on polls. node-postgres needs a dedicated
+	 * client for this (a pooled client cannot hold a `LISTEN`); porsager
+	 * `postgres` has `sql.listen`.
+	 */
+	listen?(
+		channel: string,
+		onNotify: (payload: string) => void,
+	): Promise<() => void | Promise<void>>;
 }
 
 // ─── Public factory ─────────────────────────────────────────────────────────
@@ -362,7 +376,19 @@ function prefixed(table: string): string {
 }
 
 class PgSubmissionStore implements AgentSubmissionStore {
-	constructor(private runner: PostgresRunner) {}
+	readonly subscribeAbortRequests?: (listener: (sessionKey: string) => void) => () => void;
+
+	constructor(private runner: PostgresRunner) {
+		const { listen } = runner;
+		if (listen) {
+			this.subscribeAbortRequests = (listener) => {
+				const listening = listen.call(runner, SUBMISSION_ABORT_CHANNEL, listener);
+				return () => {
+					void listening.then((unlisten) => unlisten()).catch(() => {});
+				};
+			};
+		}
+	}
 
 	// ── Query ────────────────────────────────────────────────────────────
 
@@ -581,6 +607,15 @@ class PgSubmissionStore implements AgentSubmissionStore {
 			 RETURNING submission_id`,
 			[Date.now(), sessionKey],
 		);
+		if (rows.length > 0 && fitsNotifyPayload(sessionKey)) {
+			// After the stamp commits, so a woken owner reads a durable intent.
+			// Best-effort: the owner's poll and deadline scan still find it.
+			await this.runner
+				.query('SELECT pg_notify($1, $2)', [SUBMISSION_ABORT_CHANNEL, sessionKey])
+				.catch((error: unknown) => {
+					console.error('[flue:postgres] Could not signal an abort request:', error);
+				});
+		}
 		return rows.map((row) => String(row.submission_id));
 	}
 

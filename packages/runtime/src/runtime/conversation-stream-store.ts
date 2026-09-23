@@ -93,6 +93,13 @@ export interface ConversationStreamStore {
 		options?: { offset?: string; limit?: number },
 	): Promise<ConversationStreamReadResult>;
 	getMeta(path: string): Promise<ConversationStreamMeta | null>;
+	/**
+	 * Call `listener` after appends to `path`. A store always signals its own
+	 * appends; one whose backend can relay appends between processes (see
+	 * `SqlConversationDialect.listenAppends`) signals other processes' too.
+	 * Listeners must re-read rather than trust a signal's timing: signals may
+	 * be missed or duplicated, and readers bound every wait.
+	 */
 	subscribe(path: string, listener: () => void): () => void;
 	/**
 	 * Optional fold-checkpoint capability (presence-checked like

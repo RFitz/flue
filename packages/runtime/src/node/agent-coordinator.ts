@@ -134,6 +134,8 @@ interface ActiveSubmission {
 	abort: AbortController;
 	/** The attempt this task runs; a reclaim replaces it on the row. */
 	readonly attemptId: string | undefined;
+	/** The durable session the attempt runs in, which aborts target. */
+	readonly sessionKey: string;
 	/** When this process last knew it held the lease (claim or renewal). */
 	leaseHeldAt: number;
 	/** Set once the lease is lost: the task stops without settling. */
@@ -147,6 +149,11 @@ export interface NodeAgentCoordinatorTimings {
 	readonly heartbeatIntervalMs?: number;
 	/** Period of the expired-lease and deadline scan. */
 	readonly leaseScanIntervalMs?: number;
+	/**
+	 * Period of the abort-intent poll over live attempts, used only when the
+	 * submission store cannot push abort requests between processes.
+	 */
+	readonly abortPollIntervalMs?: number;
 }
 
 export function createNodeAgentCoordinator(options: {
@@ -430,6 +437,7 @@ export function createNodeAgentCoordinator(options: {
 			task: Promise.resolve(),
 			abort: controller,
 			attemptId: claimed.attemptId,
+			sessionKey: claimed.sessionKey,
 			leaseHeldAt: Date.now(),
 			leaseLost: false,
 		};
@@ -633,6 +641,7 @@ export function createNodeAgentCoordinator(options: {
 				heartbeatInterval.unref();
 			}
 		}
+		watchAbortRequests();
 		// Start periodic lease-scan wake: ensures the claim loop wakes up
 		// to discover expired leases even when no new work is being admitted.
 		// Without this, a sleeping claim loop would never check for stale
@@ -721,6 +730,55 @@ export function createNodeAgentCoordinator(options: {
 			outcome: 'lease_lost',
 		});
 		active.abort.abort(new DOMException('Submission lease lost.', 'AbortError'));
+	}
+
+	// ── Cross-process aborts ─────────────────────────────────────────────
+
+	const ABORT_POLL_INTERVAL_MS = options.timings?.abortPollIntervalMs ?? 1_000;
+	let stopAbortSubscription: (() => void) | undefined;
+	let abortPollInterval: ReturnType<typeof setInterval> | null = null;
+	let abortPollRunning = false;
+
+	/**
+	 * `abortInstance` fires controllers only in the process it runs in; an
+	 * attempt live in another process learns of the durable intent here. A
+	 * store that pushes abort requests reaches it at once; otherwise poll
+	 * the live attempts' rows. The deadline scan remains the backstop.
+	 */
+	function watchAbortRequests(): void {
+		if (stopAbortSubscription || abortPollInterval) return;
+		if (submissions.subscribeAbortRequests) {
+			stopAbortSubscription = submissions.subscribeAbortRequests((sessionKey) => {
+				for (const active of activeSubmissions.values()) {
+					if (active.sessionKey === sessionKey) active.abort.abort(new SubmissionAbortedError());
+				}
+			});
+			return;
+		}
+		abortPollInterval = setInterval(() => {
+			if (abortPollRunning || activeSubmissions.size === 0) return;
+			abortPollRunning = true;
+			void pollAbortIntents().finally(() => {
+				abortPollRunning = false;
+			});
+		}, ABORT_POLL_INTERVAL_MS);
+		if (typeof abortPollInterval === 'object' && 'unref' in abortPollInterval) {
+			abortPollInterval.unref();
+		}
+	}
+
+	async function pollAbortIntents(): Promise<void> {
+		for (const [submissionId, active] of [...activeSubmissions]) {
+			let row: AgentSubmission | null;
+			try {
+				row = await submissions.getSubmission(submissionId);
+			} catch {
+				continue;
+			}
+			if (row?.status === 'running' && row.abortRequestedAt !== undefined) {
+				active.abort.abort(new SubmissionAbortedError());
+			}
+		}
 	}
 
 	// ── Reconciliation ───────────────────────────────────────────────────
@@ -1477,6 +1535,12 @@ export function createNodeAgentCoordinator(options: {
 				clearInterval(leaseScanInterval);
 				leaseScanInterval = null;
 			}
+			if (abortPollInterval) {
+				clearInterval(abortPollInterval);
+				abortPollInterval = null;
+			}
+			stopAbortSubscription?.();
+			stopAbortSubscription = undefined;
 
 			if (activeSubmissions.size > 0) {
 				const abandoned = [...activeSubmissions.keys()];

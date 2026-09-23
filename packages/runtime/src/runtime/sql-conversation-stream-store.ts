@@ -47,6 +47,18 @@ export interface SqlConversationDialect {
 	validatePath?(path: string, operation: string): void;
 	query(sql: string, params: readonly unknown[]): Promise<Record<string, unknown>[]>;
 	transaction<T>(fn: (tx: SqlConversationDialectTx) => Promise<T>): Promise<T>;
+	/**
+	 * Signal other processes that `path` gained a batch. Runs inside the
+	 * append's transaction, so a signal is delivered only if the append
+	 * commits (Postgres: `pg_notify`).
+	 */
+	notifyAppend?(tx: SqlConversationDialectTx, path: string): Promise<void>;
+	/**
+	 * Deliver other processes' append signals for the life of the store.
+	 * Without it, only this process's appends wake its subscribers, and
+	 * readers fall back to their poll timeouts.
+	 */
+	listenAppends?(onAppend: (path: string) => void): Promise<unknown>;
 }
 
 /**
@@ -64,6 +76,7 @@ export function defineSqlConversationStreamStore(
 
 class SqlConversationStreamStore implements ConversationStreamStore {
 	private listeners = new StreamListenerRegistry();
+	private remoteAppends: Promise<unknown> | undefined;
 
 	constructor(private dialect: SqlConversationDialect) {}
 
@@ -209,6 +222,7 @@ class SqlConversationStreamStore implements ConversationStreamStore {
 				 WHERE path = ${p(1)}`,
 				[input.path],
 			);
+			await dialect.notifyAppend?.(tx, input.path);
 			return { offset: formatOffset(seq), appended: true };
 		});
 		if (result.appended) this.listeners.notify(input.path);
@@ -272,7 +286,23 @@ class SqlConversationStreamStore implements ConversationStreamStore {
 	}
 
 	subscribe(path: string, listener: () => void): () => void {
+		this.listenForRemoteAppends();
 		return this.listeners.subscribe(path, listener);
+	}
+
+	/**
+	 * Relay other processes' append signals into the local registry, started
+	 * by the first subscriber. A failed start is retried by the next one.
+	 */
+	private listenForRemoteAppends(): void {
+		const listen = this.dialect.listenAppends;
+		if (!listen || this.remoteAppends) return;
+		this.remoteAppends = listen
+			.call(this.dialect, (path) => this.listeners.notify(path))
+			.catch((error: unknown) => {
+				console.error('[flue:conversation-stream] Could not listen for remote appends:', error);
+				this.remoteAppends = undefined;
+			});
 	}
 
 	async putFoldCheckpoint(path: string, checkpoint: ConversationFoldCheckpoint): Promise<void> {

@@ -31,8 +31,14 @@ function Echo() {
 
 const faux = fauxProvider({ models: [{ id: 'model' }] });
 
-function pgliteRunner(db: PGlite): PostgresRunner {
+function pgliteRunner(db: PGlite, options: { listen?: boolean } = {}): PostgresRunner {
 	return {
+		...(options.listen === false
+			? {}
+			: {
+					listen: (channel: string, onNotify: (payload: string) => void) =>
+						db.listen(channel, onNotify),
+				}),
 		query: async (text, params) => (await db.query(text, params)).rows as Record<string, unknown>[],
 		transaction: (fn) =>
 			db.transaction((tx) =>
@@ -47,8 +53,8 @@ function pgliteRunner(db: PGlite): PostgresRunner {
 
 type NodeProcess = Awaited<ReturnType<typeof startProcess>>;
 
-async function startProcess(db: PGlite) {
-	const adapter = postgres(pgliteRunner(db));
+async function startProcess(db: PGlite, options: { listen?: boolean } = {}) {
+	const adapter = postgres(pgliteRunner(db, options));
 	const connected = await adapter.connect();
 	const { conversationStreamStore, attachmentStore } = connected;
 	if (!conversationStreamStore || !attachmentStore) {
@@ -70,7 +76,7 @@ async function startProcess(db: PGlite) {
 		conversationStreamStore: stores.conversationStreamStore,
 		attachmentStore: stores.attachmentStore,
 		env: {},
-		timings: { heartbeatIntervalMs: 100 },
+		timings: { heartbeatIntervalMs: 100, abortPollIntervalMs: 100 },
 	});
 	return { coordinator, stores };
 }
@@ -281,6 +287,38 @@ describe('Node coordinators sharing one Postgres', { timeout: 30_000 }, () => {
 		expect(
 			await eventually(async () => (await settledStatus(a, id, first)).outcome === 'aborted', 3000),
 		).toBe(true);
+	});
+
+	it('aborts a live attempt in another process by polling when the driver cannot LISTEN', async () => {
+		const owner = await startProcess(db, { listen: false });
+		const requester = await startProcess(db, { listen: false });
+		const started = gate();
+		faux.setResponses([
+			async (_context, options) => {
+				started.open();
+				await new Promise<void>((resolve) => {
+					options?.signal?.addEventListener('abort', () => resolve(), { once: true });
+				});
+				return reply('aborted');
+			},
+		]);
+		const id = 'abort-poll';
+		try {
+			const first = await admit(owner, id, 'first');
+			await started.opened;
+			expect(await requester.coordinator.abortInstance('Echo', id)).toBe(true);
+			expect(
+				await eventually(
+					async () => (await settledStatus(owner, id, first)).outcome === 'aborted',
+					3000,
+				),
+			).toBe(true);
+		} finally {
+			await Promise.allSettled([
+				owner.coordinator.shutdown(1000),
+				requester.coordinator.shutdown(1000),
+			]);
+		}
 	});
 
 	// Stream listeners are an in-process registry: B's long-poll/SSE readers

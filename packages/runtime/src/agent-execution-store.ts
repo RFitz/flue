@@ -244,6 +244,14 @@ export interface AgentSubmissionStore {
 	 */
 	requestSessionAbort(sessionKey: string): Promise<string[]>;
 	/**
+	 * Optional cross-process push for {@link requestSessionAbort}: calls
+	 * `listener` with the session key of every abort any process requests,
+	 * after the intent is durable. The Node coordinator aborts its live
+	 * attempts for that session at once; without this capability it polls
+	 * its live attempts' abort intents instead. Returns an unsubscribe.
+	 */
+	subscribeAbortRequests?(listener: (sessionKey: string) => void): () => void;
+	/**
 	 * Return a running submission to queued for a clean first attempt —
 	 * clearing its attempt, owner, lease, and durability stamp (a requeued
 	 * submission re-stamps at its next input application) — gated only on

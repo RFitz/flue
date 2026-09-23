@@ -512,12 +512,16 @@ export class MongoSubmissionStore implements AgentSubmissionStore {
 		);
 	}
 
-	async renewLeases(ownerId: string, submissionIds: string[]): Promise<void> {
-		if (submissionIds.length)
-			await this.c('submissions').updateMany(
-				{ ownerId, status: 'running', submissionId: { $in: submissionIds } },
-				{ $set: { leaseExpiresAt: Date.now() + LEASE_DURATION_MS } },
-			);
+	async renewLeases(ownerId: string, submissionIds: string[]): Promise<string[]> {
+		if (submissionIds.length === 0) return [];
+		const filter = { ownerId, status: 'running', submissionId: { $in: submissionIds } };
+		await this.c('submissions').updateMany(filter, {
+			$set: { leaseExpiresAt: Date.now() + LEASE_DURATION_MS },
+		});
+		// Not atomic with the update: a row reclaimed in between is reported as
+		// not renewed, which only makes the coordinator re-check it.
+		const rows = await this.c('submissions').find(filter);
+		return rows.map((row) => String(row.submissionId));
 	}
 	async listExpiredSubmissions(): Promise<AgentSubmission[]> {
 		const rows = await this.c('submissions').find(

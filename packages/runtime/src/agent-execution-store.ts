@@ -370,10 +370,13 @@ export interface AgentSubmissionStore {
 	// Lease management
 	/**
 	 * Extend the lease expiry (now + `LEASE_DURATION_MS`) for each listed
-	 * submission that is running AND owned by `ownerId`. Submissions owned
-	 * by another coordinator, settled, or unknown are silently skipped.
+	 * submission that is running AND owned by `ownerId`, and return the ids
+	 * it renewed. Submissions owned by another coordinator, settled, or
+	 * unknown are skipped and left out of the result. The Node coordinator
+	 * re-checks a live attempt missing from the result and stops it if the
+	 * row was reclaimed.
 	 */
-	renewLeases(ownerId: string, submissionIds: string[]): Promise<void>;
+	renewLeases(ownerId: string, submissionIds: string[]): Promise<readonly string[]>;
 	/**
 	 * Running submissions whose lease has expired (a positive
 	 * `leaseExpiresAt` in the past). Queued and settled submissions are

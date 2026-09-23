@@ -717,13 +717,15 @@ class RedisSubmissionStore implements AgentSubmissionStore {
 		return output.sort((left, right) => left.sequence - right.sequence).map((item) => item.id);
 	}
 
-	async renewLeases(ownerId: string, submissionIds: string[]): Promise<void> {
-		if (submissionIds.length === 0) return;
-		await this.backend.eval(
+	async renewLeases(ownerId: string, submissionIds: string[]): Promise<string[]> {
+		if (submissionIds.length === 0) return [];
+		// The script returns the 1-based KEYS positions it renewed.
+		const renewed = await this.backend.eval(
 			renewLeasesScript,
 			submissionIds.map((id) => this.backend.keys.submission(id)),
 			[ownerId, Date.now() + LEASE_DURATION_MS],
 		);
+		return strings(renewed).flatMap((position) => submissionIds[Number(position) - 1] ?? []);
 	}
 
 	async listExpiredSubmissions(): Promise<AgentSubmission[]> {

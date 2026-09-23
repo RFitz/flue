@@ -225,11 +225,15 @@ return 1
 `;
 
 export const renewLeasesScript = `${guard}
+local renewed = {}
 for i = 1, #KEYS do
   require_type(KEYS[i], 'hash')
-  if redis.call('HGET', KEYS[i], 'status') == 'running' and redis.call('HGET', KEYS[i], 'ownerId') == ARGV[1] then redis.call('HSET', KEYS[i], 'leaseExpiresAt', ARGV[2]) end
+  if redis.call('HGET', KEYS[i], 'status') == 'running' and redis.call('HGET', KEYS[i], 'ownerId') == ARGV[1] then
+    redis.call('HSET', KEYS[i], 'leaseExpiresAt', ARGV[2])
+    table.insert(renewed, i)
+  end
 end
-return 1
+return renewed
 `;
 
 // Re-derive every status index from the row hash, the authority. Status and

@@ -998,18 +998,29 @@ class MysqlSubmissionStore implements AgentSubmissionStore {
 		});
 	}
 
-	async renewLeases(ownerId: string, submissionIds: string[]): Promise<void> {
-		if (submissionIds.length === 0) return;
+	async renewLeases(ownerId: string, submissionIds: string[]): Promise<string[]> {
+		if (submissionIds.length === 0) return [];
 		const now = Date.now();
 		const leaseExpiresAt = now + LEASE_DURATION_MS;
 		const placeholders = submissionIds.map(() => '?').join(', ');
-		await this.runner.query(
-			`UPDATE flue_agent_submissions
-			 SET lease_expires_at = ?
-			 WHERE owner_id = ? AND status = 'running'
-			   AND submission_id IN (${placeholders})`,
-			[leaseExpiresAt, ownerId, ...submissionIds],
-		);
+		// No UPDATE ... RETURNING: read the renewed rows back under the
+		// UPDATE's row locks.
+		return this.runner.transaction(async (tx) => {
+			await tx.query(
+				`UPDATE flue_agent_submissions
+				 SET lease_expires_at = ?
+				 WHERE owner_id = ? AND status = 'running'
+				   AND submission_id IN (${placeholders})`,
+				[leaseExpiresAt, ownerId, ...submissionIds],
+			);
+			const rows = await tx.query(
+				`SELECT submission_id FROM flue_agent_submissions
+				 WHERE owner_id = ? AND status = 'running'
+				   AND submission_id IN (${placeholders})`,
+				[ownerId, ...submissionIds],
+			);
+			return rows.map((row) => String(row.submission_id));
+		});
 	}
 
 	async listExpiredSubmissions(): Promise<AgentSubmission[]> {

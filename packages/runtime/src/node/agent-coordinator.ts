@@ -125,6 +125,30 @@ export function createNodeDispatchQueue(coordinator: NodeAgentCoordinator): Disp
 	};
 }
 
+/**
+ * A submission task live in this process. The lease fields tie the task to
+ * the durable row: the heartbeat stops a task whose row another process took.
+ */
+interface ActiveSubmission {
+	task: Promise<void>;
+	abort: AbortController;
+	/** The attempt this task runs; a reclaim replaces it on the row. */
+	readonly attemptId: string | undefined;
+	/** When this process last knew it held the lease (claim or renewal). */
+	leaseHeldAt: number;
+	/** Set once the lease is lost: the task stops without settling. */
+	leaseLost: boolean;
+	writer?: ConversationRecordWriter;
+}
+
+/** Coordinator timer periods, overridable so tests need not wait them out. */
+export interface NodeAgentCoordinatorTimings {
+	/** Lease renewal period; must stay well under `LEASE_DURATION_MS`. */
+	readonly heartbeatIntervalMs?: number;
+	/** Period of the expired-lease and deadline scan. */
+	readonly leaseScanIntervalMs?: number;
+}
+
 export function createNodeAgentCoordinator(options: {
 	submissions: AgentSubmissionStore;
 	agents: ReadonlyArray<{ name: string; agent: Agent }>;
@@ -134,6 +158,7 @@ export function createNodeAgentCoordinator(options: {
 	/** Runtime environment stamped on coordinator-emitted events' contexts. */
 	env?: Record<string, unknown>;
 	activityGate?: RuntimeActivityGate;
+	timings?: NodeAgentCoordinatorTimings;
 }): NodeAgentCoordinator {
 	const {
 		submissions,
@@ -190,10 +215,7 @@ export function createNodeAgentCoordinator(options: {
 	// ── Concurrent claim loop state ──────────────────────────────────────
 
 	/** Submissions currently being processed, keyed by submissionId. */
-	const activeSubmissions = new Map<
-		string,
-		{ task: Promise<void>; abort: AbortController; writer?: ConversationRecordWriter }
-	>();
+	const activeSubmissions = new Map<string, ActiveSubmission>();
 
 	/**
 	 * Wake signal. The claim loop sleeps on `wakePromise` when there is
@@ -404,11 +426,13 @@ export function createNodeAgentCoordinator(options: {
 	function spawnSubmissionTask(claimed: AgentSubmission): void {
 		const controller = new AbortController();
 		const emitCoordinatorEvent = coordinatorEventEmitter(claimed.input);
-		const entry: {
-			task: Promise<void>;
-			abort: AbortController;
-			writer?: ConversationRecordWriter;
-		} = { task: Promise.resolve(), abort: controller };
+		const entry: ActiveSubmission = {
+			task: Promise.resolve(),
+			abort: controller,
+			attemptId: claimed.attemptId,
+			leaseHeldAt: Date.now(),
+			leaseLost: false,
+		};
 		const task = (async () => {
 			// Acquired after the claim CAS, so this attempt's producer epoch
 			// fences every earlier writer for the conversation.
@@ -422,8 +446,11 @@ export function createNodeAgentCoordinator(options: {
 				conversationWriter,
 				emitCoordinatorEvent,
 				signal: controller.signal,
+				// A lost lease unwinds like shutdown: the row belongs to its new
+				// owner, so this task must not settle it.
 				isShutdownAbort: (error) =>
-					stopping && error instanceof DOMException && error.name === 'AbortError',
+					entry.leaseLost ||
+					(stopping && error instanceof DOMException && error.name === 'AbortError'),
 			});
 		})()
 			.catch((error) => {
@@ -594,21 +621,11 @@ export function createNodeAgentCoordinator(options: {
 		// Start lease heartbeat: periodically renew leases for all active
 		// submissions so they aren't reclaimed by another coordinator.
 		if (!heartbeatInterval) {
-			const HEARTBEAT_INTERVAL_MS = 10_000;
 			heartbeatInterval = setInterval(() => {
-				const ids = [...activeSubmissions.keys()];
-				if (ids.length === 0) return;
-				submissions.renewLeases(ownerId, ids).catch((error) => {
-					console.error('[flue:lease-heartbeat] Failed to renew leases:', error);
-					passEventEmitter(
-						{
-							type: 'submission_recovery',
-							operation: 'process_submission',
-							outcome: 'deferred',
-							error: serializeSubmissionError(error),
-						},
-						{ errorInfo: classifyError(error) },
-					);
+				if (heartbeatRunning) return;
+				heartbeatRunning = true;
+				void renewActiveLeases().finally(() => {
+					heartbeatRunning = false;
 				});
 			}, HEARTBEAT_INTERVAL_MS);
 			// Don't let the heartbeat prevent process exit.
@@ -628,10 +645,88 @@ export function createNodeAgentCoordinator(options: {
 		}
 	}
 
+	// ── Lease heartbeat ──────────────────────────────────────────────────
+
+	const HEARTBEAT_INTERVAL_MS = options.timings?.heartbeatIntervalMs ?? 10_000;
+	let heartbeatRunning = false;
+
+	/**
+	 * Renew every live attempt's lease and stop the attempts this process no
+	 * longer owns. A lease is lost when the renewal skips a row that now
+	 * shows another attempt (another process reclaimed it while this one
+	 * stalled), or when renewals have failed for a whole lease duration, by
+	 * which point another process may have reclaimed it. Stopping aborts the
+	 * attempt's controller, which ends its model and tool calls at their
+	 * next signal check. Stream writes are fenced regardless; this bounds the
+	 * zombie's other side effects.
+	 */
+	async function renewActiveLeases(): Promise<void> {
+		const entries = [...activeSubmissions];
+		if (entries.length === 0) return;
+		const renewedAt = Date.now();
+		let renewed: readonly string[];
+		try {
+			renewed = await submissions.renewLeases(
+				ownerId,
+				entries.map(([submissionId]) => submissionId),
+			);
+		} catch (error) {
+			console.error('[flue:lease-heartbeat] Failed to renew leases:', error);
+			passEventEmitter(
+				{
+					type: 'submission_recovery',
+					operation: 'process_submission',
+					outcome: 'deferred',
+					error: serializeSubmissionError(error),
+				},
+				{ errorInfo: classifyError(error) },
+			);
+			for (const [submissionId, active] of entries) {
+				if (Date.now() >= active.leaseHeldAt + LEASE_DURATION_MS) {
+					stopLostAttempt(submissionId, active);
+				}
+			}
+			return;
+		}
+		const kept = new Set(renewed);
+		for (const [submissionId, active] of entries) {
+			if (kept.has(submissionId)) {
+				active.leaseHeldAt = renewedAt;
+				continue;
+			}
+			// Skipped rows are usually benign (the task is settling); stop the
+			// task only when the row shows it was taken.
+			let row: AgentSubmission | null;
+			try {
+				row = await submissions.getSubmission(submissionId);
+			} catch {
+				continue;
+			}
+			if (
+				!row ||
+				row.status === 'queued' ||
+				(row.status === 'running' && row.attemptId !== active.attemptId)
+			) {
+				stopLostAttempt(submissionId, active);
+			}
+		}
+	}
+
+	function stopLostAttempt(submissionId: string, active: ActiveSubmission): void {
+		if (active.leaseLost || activeSubmissions.get(submissionId) !== active) return;
+		active.leaseLost = true;
+		console.error('[flue:lease-heartbeat]', {
+			submissionId,
+			operation: 'process_submission',
+			outcome: 'lease_lost',
+		});
+		active.abort.abort(new DOMException('Submission lease lost.', 'AbortError'));
+	}
+
 	// ── Reconciliation ───────────────────────────────────────────────────
 
 	/** Interval (ms) between periodic expired-lease scans in the claim loop. */
-	const LEASE_SCAN_INTERVAL_MS = 15_000;
+	const LEASE_SCAN_INTERVAL_MS = options.timings?.leaseScanIntervalMs ?? 15_000;
 	let lastLeaseScanAt = 0;
 
 	/**

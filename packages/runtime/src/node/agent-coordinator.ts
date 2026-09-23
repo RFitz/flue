@@ -316,29 +316,33 @@ export function createNodeAgentCoordinator(options: {
 	 * unborn. Only a creation acquires the producer; an existing instance may
 	 * have a live attempt in another process, which an acquire would fence
 	 * out. Two processes creating the same instance race on the producer:
-	 * the loser's append fails as stale, and it adopts the winner's record.
+	 * the loser's append fails as stale, possibly before the winner has
+	 * appended, so it retries from the read until one of them has written.
 	 */
 	async function ensureConversationIdentity(
 		input: AgentSubmissionInput,
 		agent: Agent,
 	): Promise<InstanceIdentity | undefined> {
-		const state = await readConversationState(input);
-		if (!state) return undefined;
-		const existing = findInstanceIdentity(state);
-		if (existing) return existing;
-		const writer = await acquireConversationWriter(input);
-		if (!writer) return undefined;
-		try {
-			return await ensureInstanceIdentity(writer, agent, input.initialData);
-		} catch (error) {
-			const raced = await readConversationState(input);
-			const adopted = raced && findInstanceIdentity(raced);
-			if (adopted) return adopted;
-			throw error;
-		} finally {
-			writer.release();
+		for (let attempt = 1; ; attempt += 1) {
+			const state = await readConversationState(input);
+			if (!state) return undefined;
+			const existing = findInstanceIdentity(state);
+			if (existing) return existing;
+			const writer = await acquireConversationWriter(input);
+			if (!writer) return undefined;
+			try {
+				return await ensureInstanceIdentity(writer, agent, input.initialData);
+			} catch (error) {
+				if (attempt >= BIRTH_RACE_ATTEMPTS) throw error;
+				await new Promise((resolve) => setTimeout(resolve, 20 * attempt));
+			} finally {
+				writer.release();
+			}
 		}
 	}
+
+	/** Tries at a birth record before admission gives up on a producer race. */
+	const BIRTH_RACE_ATTEMPTS = 4;
 
 	/** Run `work` with a writer acquired for it, releasing the writer after. */
 	async function withConversationWriter<T>(
@@ -1422,17 +1426,23 @@ export function createNodeAgentCoordinator(options: {
 					// would strand with nothing to ever claim it.
 					try {
 						let identity: InstanceIdentity | undefined;
+						// Read the attach offset before the row can be claimed: once it is,
+						// another process may append this submission's records, and an
+						// offset past them would hide them from the caller.
+						let offset = '-1';
 						if (admitted.canonicalReadyAt === null) {
 							identity = await materializeSubmissionConversation(input, agent);
+							if (!deduplicated) {
+								offset = (await readConversationState(input))?.recordsThroughOffset ?? '-1';
+							}
 							// Tolerate a null return: the claim loop's materialize-unready
 							// pass races this admission and can mark-then-claim the row
 							// first, so null means "already advanced past queued" — a
 							// healthy row, not a lost submission (rows are never deleted).
 							await submissions.markSubmissionCanonicalReady(input.submissionId);
+						} else if (!deduplicated) {
+							offset = (await readConversationState(input))?.recordsThroughOffset ?? '-1';
 						}
-						const offset = deduplicated
-							? '-1'
-							: ((await readConversationState(input))?.recordsThroughOffset ?? '-1');
 						// An adopted replay may hold neither the contact uid nor a fresh
 						// identity (its gate ran before the winning admission
 						// materialized) — read the recorded identity back instead.

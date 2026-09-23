@@ -103,6 +103,40 @@ The same seam adapts drivers that support interactive transactions on one
 connection. For Neon, use its WebSocket `Pool`; the HTTP query client cannot
 implement this callback transaction contract.
 
+### Running more than one process
+
+When several server processes share the database, add an optional `listen` to
+the runner. Flue sends `pg_notify` when a conversation appends and when an
+abort is requested; with `listen`, other processes wake their stream readers
+and stop the aborted work at once. Without it, everything still works, but
+aborts reach other processes by a one-second poll and stream readers by their
+poll timeouts.
+
+`listen(channel, onNotify)` starts a `LISTEN` and resolves to a function that
+stops it. A pooled `pg` client cannot hold a `LISTEN`, so check one out for it.
+Flue listens on two channels, so this keeps up to two clients checked out:
+
+```ts title="src/db.ts"
+export default postgres({
+  // query, transaction, close as above
+  listen: async (channel, onNotify) => {
+    const client = await pool.connect();
+    client.on('notification', (message) => {
+      if (message.channel === channel) onNotify(message.payload ?? '');
+    });
+    await client.query(`LISTEN ${channel}`);
+    return async () => {
+      await client.query(`UNLISTEN ${channel}`);
+      client.release();
+    };
+  },
+});
+```
+
+A dropped listening connection loses signals, not correctness: the polls and
+lease scans remain the backstop. porsager `postgres` users can wrap
+`sql.listen(channel, onNotify)`.
+
 ## Migrations
 
 The adapter's `migrate()` hook runs automatically when the generated Node

@@ -661,14 +661,15 @@ export async function reconcileInterruptedSubmission(
 	// option A in plans/2026-07-13-single-source-of-truth-ledger-design.md —
 	// make that the FIRST commit of multi-process support):
 	//
-	// - Narrow today: Cloudflare DOs are single-threaded and multi-process
-	//   Node is unsupported, so the only in-process race is deadline
-	//   enforcement settling over a live-but-hung fiber (the force path
-	//   shares the zombie's attemptId, so the stream fence admits both until
-	//   the settlement CAS lands). A zombie that wakes inside that window
-	//   can interleave writes with the terminal records; first-terminal-wins
-	//   and the idempotent terminal path bound the damage to stray timeline
-	//   entries.
+	// - Narrow today: Cloudflare DOs are single-threaded, so there the only
+	//   race is deadline enforcement settling over a live-but-hung fiber
+	//   (the force path shares the zombie's attemptId, so the stream fence
+	//   admits both until the settlement CAS lands). A zombie that wakes
+	//   inside that window can interleave writes with the terminal records;
+	//   first-terminal-wins and the idempotent terminal path bound the
+	//   damage to stray timeline entries. The Node coordinator closes that
+	//   window: its force path acquires a fresh stream producer before
+	//   settling, so the zombie's writer fails on the producer epoch.
 	// - Narrow even if raced: racing reconcilers derive the reason from the
 	//   same durable row facts, so their advisories are byte-identical and
 	//   the terminal path's idempotency check absorbs the race; content can

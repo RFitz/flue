@@ -128,7 +128,8 @@ Graceful shutdown aborts active submissions at the turn boundary and waits for t
 Two consequences for deployment:
 
 - **Recovery is only as durable as the database.** With the in-memory default, accepted work survives interruptions within the process lifetime but a restart loses everything; cross-restart recovery requires a durable adapter in [`db.ts`](/docs/guide/database/).
-- **One live owner per conversation.** A shared database lets a _replacement_ process recover accepted work, but it does not make two concurrent owners of the same conversation safe. Multi-replica deployments must route each conversation to one owner and avoid overlapping owners during replacement.
+- **Any process can serve any conversation.** Over a shared durable database, every process can admit, claim, and recover any conversation's work, so replicas need no sticky routing. Each claimed attempt takes the conversation's stream producer, which fences out every earlier writer in any process. The lease heartbeat stops an attempt whose lease another process reclaimed, ending its model and tool calls at their next abort check.
+- **What leases cannot bound.** A stalled attempt's model and tool calls can continue until its next heartbeat, or until its lease would expire if it cannot reach the database. Lease expiry compares clocks across hosts, so keep them synchronized. Aborts and live stream updates reach other processes at once on [Postgres with a `listen` runner](/docs/ecosystem/databases/postgres/#running-more-than-one-process); elsewhere they arrive by polling.
 
 See the [Node.js target guide](/docs/guide/node-target/#state-and-durability) for the rest of the target's behavior.
 

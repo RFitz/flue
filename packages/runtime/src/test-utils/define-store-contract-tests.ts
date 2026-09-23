@@ -1032,7 +1032,9 @@ export function defineStoreContractTests(label: string, backend: StoreContractTe
 					ownerId: 'owner-a',
 					leaseExpiresAt: expiry,
 				});
-				await store.renewLeases('owner-a', ['dispatch-1']);
+				expect(await store.renewLeases('owner-a', ['dispatch-1', 'unknown'])).toEqual([
+					'dispatch-1',
+				]);
 				const submission = await store.getSubmission('dispatch-1');
 				if (!submission) throw new Error('Expected renewed submission to exist.');
 				expect(submission.leaseExpiresAt).toBeGreaterThan(expiry);
@@ -1048,7 +1050,7 @@ export function defineStoreContractTests(label: string, backend: StoreContractTe
 					ownerId: 'owner-a',
 					leaseExpiresAt: expiry,
 				});
-				await store.renewLeases('owner-b', ['dispatch-1']);
+				expect(await store.renewLeases('owner-b', ['dispatch-1'])).toEqual([]);
 				const submission = await store.getSubmission('dispatch-1');
 				if (!submission) throw new Error('Expected submission to exist.');
 				expect(submission.leaseExpiresAt).toBe(expiry);
@@ -1059,8 +1061,8 @@ export function defineStoreContractTests(label: string, backend: StoreContractTe
 				await admitDispatchReady(store, dispatchInput());
 				await store.claimSubmission(claim('dispatch-1', 'attempt-1'));
 				await store.completeSubmission(attempt('dispatch-1', 'attempt-1'));
-				// Should not throw — settled submissions are silently skipped.
-				await store.renewLeases('test-owner', ['dispatch-1']);
+				// Should not throw — settled submissions are skipped.
+				expect(await store.renewLeases('test-owner', ['dispatch-1'])).toEqual([]);
 			});
 		});
 

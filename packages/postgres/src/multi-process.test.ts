@@ -49,10 +49,12 @@ type NodeProcess = Awaited<ReturnType<typeof startProcess>>;
 
 async function startProcess(db: PGlite) {
 	const adapter = postgres(pgliteRunner(db));
-	const stores = await adapter.connect();
-	if (!stores.conversationStreamStore || !stores.attachmentStore) {
+	const connected = await adapter.connect();
+	const { conversationStreamStore, attachmentStore } = connected;
+	if (!conversationStreamStore || !attachmentStore) {
 		throw new Error('postgres adapter did not provide conversation stores');
 	}
+	const stores = { ...connected, conversationStreamStore, attachmentStore };
 	const coordinator = createNodeAgentCoordinator({
 		submissions: stores.submissionStore,
 		agents: [{ name: 'Echo', agent: Echo }],
@@ -68,6 +70,7 @@ async function startProcess(db: PGlite) {
 		conversationStreamStore: stores.conversationStreamStore,
 		attachmentStore: stores.attachmentStore,
 		env: {},
+		timings: { heartbeatIntervalMs: 100 },
 	});
 	return { coordinator, stores };
 }
@@ -97,7 +100,7 @@ async function settledStatus(proc: NodeProcess, instanceId: string, submissionId
 	let outcome: string | undefined;
 	let offset = '-1';
 	while (true) {
-		const page = await proc.stores.conversationStreamStore!.read(
+		const page = await proc.stores.conversationStreamStore.read(
 			agentStreamPath('Echo', instanceId),
 			{
 				offset,
@@ -218,6 +221,44 @@ describe('Node coordinators sharing one Postgres', { timeout: 30_000 }, () => {
 		).toBe(true);
 	});
 
+	// A stalled owner whose lease another process reclaimed must stop its
+	// attempt (ending its model and tool calls) and leave the row alone.
+	it('stops a live attempt whose lease another process reclaimed', async () => {
+		const started = gate();
+		const stopped = gate();
+		faux.setResponses([
+			async (_context, options) => {
+				started.open();
+				await new Promise<void>((resolve) => {
+					options?.signal?.addEventListener('abort', () => resolve(), { once: true });
+				});
+				stopped.open();
+				return reply('stopped');
+			},
+		]);
+		const id = 'reclaimed';
+
+		const first = await admit(a, id, 'first');
+		await started.opened;
+		const running = await b.stores.submissionStore.getSubmission(first);
+		if (!running?.attemptId) throw new Error('expected a running attempt');
+		const reclaimed = await b.stores.submissionStore.replaceSubmissionAttempt(
+			{ submissionId: first, attemptId: running.attemptId },
+			'att_reclaimed',
+			{ ownerId: 'owner_b', leaseExpiresAt: Date.now() + 30_000 },
+		);
+		expect(reclaimed?.attemptId).toBe('att_reclaimed');
+
+		const outcome = await Promise.race([
+			stopped.opened.then(() => 'stopped'),
+			new Promise((resolve) => setTimeout(() => resolve('still running'), 2000)),
+		]);
+		expect(outcome).toBe('stopped');
+		await a.coordinator.waitForIdle();
+		const row = await b.stores.submissionStore.getSubmission(first);
+		expect(row).toMatchObject({ status: 'running', attemptId: 'att_reclaimed' });
+	});
+
 	// abortInstance only fires controllers in its own process; the owner
 	// notices the durable intent on its next deadline scan (up to 15s).
 	it('aborts a live attempt promptly when the abort arrives at another process', async () => {
@@ -249,7 +290,7 @@ describe('Node coordinators sharing one Postgres', { timeout: 30_000 }, () => {
 		const id = 'notify';
 		const path = agentStreamPath('Echo', id);
 		let notified = 0;
-		const unsubscribe = b.stores.conversationStreamStore!.subscribe(path, () => {
+		const unsubscribe = b.stores.conversationStreamStore.subscribe(path, () => {
 			notified += 1;
 		});
 		try {

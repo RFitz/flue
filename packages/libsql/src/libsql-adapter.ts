@@ -873,18 +873,20 @@ class LibsqlSubmissionStore implements AgentSubmissionStore {
 
 	// ── Lease management ────────────────────────────────────────────────
 
-	async renewLeases(ownerId: string, submissionIds: string[]): Promise<void> {
-		if (submissionIds.length === 0) return;
+	async renewLeases(ownerId: string, submissionIds: string[]): Promise<string[]> {
+		if (submissionIds.length === 0) return [];
 		const now = Date.now();
 		const leaseExpiresAt = now + LEASE_DURATION_MS;
 		const placeholders = submissionIds.map(() => '?').join(', ');
-		await this.runner.query(
+		const rows = await this.runner.query(
 			`UPDATE flue_agent_submissions
 			 SET lease_expires_at = ?
 			 WHERE owner_id = ? AND status = 'running'
-			   AND submission_id IN (${placeholders})`,
+			   AND submission_id IN (${placeholders})
+			 RETURNING submission_id`,
 			[leaseExpiresAt, ownerId, ...submissionIds],
 		);
+		return rows.map((row) => String(row.submission_id));
 	}
 
 	async listExpiredSubmissions(): Promise<AgentSubmission[]> {

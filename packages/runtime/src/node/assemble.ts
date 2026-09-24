@@ -20,7 +20,11 @@ import type { FlueAgentRegistration } from '../runtime/registration.ts';
 import { getRegisteredFlueAgents, registerFlueAgents } from '../runtime/registration.ts';
 import type { RuntimeActivityGate } from '../runtime/runtime-activity-gate.ts';
 import { createRuntimeActivityGate } from '../runtime/runtime-activity-gate.ts';
-import { createNodeAgentCoordinator, createNodeDispatchQueue } from './agent-coordinator.ts';
+import {
+	createNodeAgentCoordinator,
+	createNodeDispatchQueue,
+	type NodeAgentCoordinatorOwnership,
+} from './agent-coordinator.ts';
 
 const SHUTDOWN_TIMEOUT_MS = 30_000;
 
@@ -155,6 +159,7 @@ export async function assembleNodeAgentRuntime(
 		attachmentStore,
 		env: runtimeEnv,
 		activityGate,
+		ownership: ownershipFromEnv(runtimeEnv),
 	});
 	const dispatchQueue = createNodeDispatchQueue(coordinator);
 
@@ -225,4 +230,23 @@ export async function assembleNodeAgentRuntime(
 			return closing;
 		},
 	};
+}
+
+/**
+ * Per-deploy override of the instance-owner idle window:
+ * `FLUE_OWNER_IDLE_TTL_MS` (milliseconds). Unset keeps the coordinator's
+ * default; an invalid value fails startup rather than silently ignoring it.
+ */
+function ownershipFromEnv(
+	env: Record<string, string | undefined>,
+): NodeAgentCoordinatorOwnership | undefined {
+	const raw = env.FLUE_OWNER_IDLE_TTL_MS?.trim();
+	if (!raw) return undefined;
+	const idleTtlMs = Number(raw);
+	if (!Number.isFinite(idleTtlMs) || idleTtlMs <= 0) {
+		throw new Error(
+			`[flue] FLUE_OWNER_IDLE_TTL_MS must be a positive number of milliseconds (got "${raw}").`,
+		);
+	}
+	return { idleTtlMs };
 }

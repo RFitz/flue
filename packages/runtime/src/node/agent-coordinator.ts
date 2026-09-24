@@ -136,6 +136,8 @@ interface ActiveSubmission {
 	readonly attemptId: string | undefined;
 	/** The durable session the attempt runs in, which aborts target. */
 	readonly sessionKey: string;
+	/** The instance's conversation stream path, which the owner lease keys on. */
+	readonly instancePath: string;
 	/** When this process last knew it held the lease (claim or renewal). */
 	leaseHeldAt: number;
 	/** Set once the lease is lost: the task stops without settling. */
@@ -154,7 +156,29 @@ export interface NodeAgentCoordinatorTimings {
 	 * submission store cannot push abort requests between processes.
 	 */
 	readonly abortPollIntervalMs?: number;
+	/**
+	 * Period of the owner's claim poll while it holds a live instance-owner
+	 * lease, used only when the conversation store cannot push owner wakes
+	 * between processes.
+	 */
+	readonly ownerPollIntervalMs?: number;
 }
+
+/**
+ * Instance ownership: which process claims a conversation's queued work.
+ * With a conversation store that offers the owner lease, the process that
+ * claims an instance's work becomes its named owner, and only the owner
+ * claims that instance's work until the lease lapses. The lease stays hot
+ * while claim-shaped work flows and goes cold after `idleTtlMs` without
+ * any; the next claim after that is open to every process.
+ */
+export interface NodeAgentCoordinatorOwnership {
+	/** How long an owner stays hot after its last claim-shaped work. Default 30s. */
+	readonly idleTtlMs?: number;
+}
+
+/** Default idle window of the instance-owner lease. */
+export const DEFAULT_OWNER_IDLE_TTL_MS = 30_000;
 
 export function createNodeAgentCoordinator(options: {
 	submissions: AgentSubmissionStore;
@@ -166,6 +190,7 @@ export function createNodeAgentCoordinator(options: {
 	env?: Record<string, unknown>;
 	activityGate?: RuntimeActivityGate;
 	timings?: NodeAgentCoordinatorTimings;
+	ownership?: NodeAgentCoordinatorOwnership;
 }): NodeAgentCoordinator {
 	const {
 		submissions,
@@ -442,6 +467,7 @@ export function createNodeAgentCoordinator(options: {
 			abort: controller,
 			attemptId: claimed.attemptId,
 			sessionKey: claimed.sessionKey,
+			instancePath: agentStreamPath(claimed.input.agent, claimed.input.id),
 			leaseHeldAt: Date.now(),
 			leaseLost: false,
 		};
@@ -496,10 +522,15 @@ export function createNodeAgentCoordinator(options: {
 					{ errorInfo: classifyError(error) },
 				);
 			})
-			.finally(() => {
+			.finally(async () => {
 				entry.writer?.release();
 				if (activeSubmissions.get(claimed.submissionId) === entry) {
 					activeSubmissions.delete(claimed.submissionId);
+				}
+				// Settling claimed work is claim-shaped: the idle window starts
+				// now, not at the claim. A lost lease or shutdown leaves it alone.
+				if (!entry.leaseLost && !stopping) {
+					await renewInstanceOwnership(entry.instancePath);
 				}
 				wake();
 			});
@@ -523,10 +554,18 @@ export function createNodeAgentCoordinator(options: {
 		await periodicLeaseScan();
 		const runnable = await submissions.listRunnableSubmissions();
 		let progressed = false;
+		const foreignRunnable = new Set<string>();
 		for (const submission of runnable) {
 			// Skip submissions already being processed in this coordinator
 			// (possible if a wake arrived between listing and claiming).
 			if (activeSubmissions.has(submission.submissionId)) continue;
+			// Only the instance's named owner claims its work while the owner
+			// lease is hot. Admission stays open everywhere: the row waits in
+			// the durable queue, and the owner is nudged to claim it.
+			if (!(await holdInstanceOwnership(submission))) {
+				foreignRunnable.add(submission.submissionId);
+				continue;
+			}
 			const claimed = await submissions.claimSubmission({
 				submissionId: submission.submissionId,
 				attemptId: generateAttemptId(),
@@ -537,7 +576,131 @@ export function createNodeAgentCoordinator(options: {
 			progressed = true;
 			spawnSubmissionTask(claimed);
 		}
+		for (const submissionId of nudgedOwnerFor) {
+			if (!foreignRunnable.has(submissionId)) nudgedOwnerFor.delete(submissionId);
+		}
 		return progressed;
+	}
+
+	// ── Instance ownership ───────────────────────────────────────────────
+
+	const OWNER_IDLE_TTL_MS = options.ownership?.idleTtlMs ?? DEFAULT_OWNER_IDLE_TTL_MS;
+	if (!Number.isFinite(OWNER_IDLE_TTL_MS) || OWNER_IDLE_TTL_MS <= 0) {
+		throw new Error(
+			`[flue] ownership.idleTtlMs must be a positive number of milliseconds (got ${OWNER_IDLE_TTL_MS}).`,
+		);
+	}
+	const OWNER_POLL_INTERVAL_MS = options.timings?.ownerPollIntervalMs ?? 1_000;
+
+	/** Instances this process holds the owner lease on, with its expiry. */
+	const ownedInstances = new Map<string, number>();
+	/** Runnable rows whose foreign owner this process already nudged. */
+	const nudgedOwnerFor = new Set<string>();
+	let ownerExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+	let ownerExpiryAt = Number.POSITIVE_INFINITY;
+	let stopOwnerWakeSubscription: (() => void) | undefined;
+	let ownerPollInterval: ReturnType<typeof setInterval> | null = null;
+
+	/**
+	 * Take or renew the instance-owner lease on `path` for claim-shaped work.
+	 * `owned` means this process may claim the instance's work: it holds the
+	 * lease, or the store has no owner lease (claims stay an open race). The
+	 * lease is layered above the submission lease and producer epoch, which
+	 * still fence every claimed attempt; it decides only who claims.
+	 */
+	async function claimInstanceOwnership(
+		path: string,
+	): Promise<
+		| { readonly owned: true }
+		| { readonly owned: false; readonly ownerId: string; readonly leaseExpiresAt: number }
+	> {
+		const store = conversationStreamStore;
+		if (!store?.claimInstanceOwner) return { owned: true };
+		const now = Date.now();
+		const claim = await store.claimInstanceOwner(path, ownerId, {
+			now,
+			leaseExpiresAt: now + OWNER_IDLE_TTL_MS,
+		});
+		if (claim.owned) ownedInstances.set(path, claim.leaseExpiresAt);
+		else ownedInstances.delete(path);
+		return claim;
+	}
+
+	/**
+	 * The claim-path gate: hold the owner lease for the submission's instance,
+	 * or nudge its owner and arrange to retry once that owner's lease lapses.
+	 */
+	async function holdInstanceOwnership(submission: AgentSubmission): Promise<boolean> {
+		const claim = await claimInstanceOwnership(
+			agentStreamPath(submission.input.agent, submission.input.id),
+		);
+		if (claim.owned) return true;
+		if (!nudgedOwnerFor.has(submission.submissionId)) {
+			nudgedOwnerFor.add(submission.submissionId);
+			void conversationStreamStore?.wakeInstanceOwner?.(claim.ownerId).catch((error: unknown) => {
+				console.error('[flue:instance-owner] Could not wake the owner:', error);
+			});
+		}
+		wakeAtOwnerExpiry(claim.leaseExpiresAt);
+		return false;
+	}
+
+	/** Renew an owned instance's lease after claim-shaped work; best effort. */
+	async function renewInstanceOwnership(path: string): Promise<void> {
+		if (!conversationStreamStore?.claimInstanceOwner) return;
+		try {
+			await claimInstanceOwnership(path);
+		} catch (error) {
+			// The lease then lapses on its own deadline; attempts stay fenced
+			// by their submission leases either way.
+			console.error('[flue:instance-owner] Could not renew the owner lease:', error);
+		}
+	}
+
+	/**
+	 * A foreign owner that goes cold (or dies) releases nothing: its lease just
+	 * lapses. Wake this process's claim loop at the lapse so the waiting work
+	 * does not sit until the next lease scan.
+	 */
+	function wakeAtOwnerExpiry(leaseExpiresAt: number): void {
+		if (stopping || leaseExpiresAt >= ownerExpiryAt) return;
+		if (ownerExpiryTimer) clearTimeout(ownerExpiryTimer);
+		ownerExpiryAt = leaseExpiresAt;
+		ownerExpiryTimer = setTimeout(
+			() => {
+				ownerExpiryTimer = null;
+				ownerExpiryAt = Number.POSITIVE_INFINITY;
+				wake();
+			},
+			Math.max(0, leaseExpiresAt - Date.now()) + 10,
+		);
+		if (typeof ownerExpiryTimer === 'object' && 'unref' in ownerExpiryTimer) {
+			ownerExpiryTimer.unref();
+		}
+	}
+
+	/**
+	 * Let other processes nudge this owner's claim loop: at once when the
+	 * store pushes owner wakes, else by polling while any owner lease held
+	 * here is hot (never once every lease has gone cold).
+	 */
+	function watchOwnerWakes(): void {
+		const store = conversationStreamStore;
+		if (!store?.claimInstanceOwner || stopOwnerWakeSubscription || ownerPollInterval) return;
+		if (store.subscribeOwnerWakes) {
+			stopOwnerWakeSubscription = store.subscribeOwnerWakes(ownerId, () => wake());
+			return;
+		}
+		ownerPollInterval = setInterval(() => {
+			const now = Date.now();
+			for (const [path, leaseExpiresAt] of ownedInstances) {
+				if (leaseExpiresAt <= now) ownedInstances.delete(path);
+			}
+			if (ownedInstances.size > 0) wake();
+		}, OWNER_POLL_INTERVAL_MS);
+		if (typeof ownerPollInterval === 'object' && 'unref' in ownerPollInterval) {
+			ownerPollInterval.unref();
+		}
 	}
 
 	/**
@@ -649,6 +812,7 @@ export function createNodeAgentCoordinator(options: {
 			}
 		}
 		watchAbortRequests();
+		watchOwnerWakes();
 		// Start periodic lease-scan wake: ensures the claim loop wakes up
 		// to discover expired leases even when no new work is being admitted.
 		// Without this, a sleeping claim loop would never check for stale
@@ -705,6 +869,11 @@ export function createNodeAgentCoordinator(options: {
 			return;
 		}
 		const kept = new Set(renewed);
+		// A live attempt is claim-shaped work: its instance stays hot.
+		const livePaths = new Set(
+			entries.filter(([submissionId]) => kept.has(submissionId)).map(([, a]) => a.instancePath),
+		);
+		for (const path of livePaths) await renewInstanceOwnership(path);
 		for (const [submissionId, active] of entries) {
 			if (kept.has(submissionId)) {
 				active.leaseHeldAt = renewedAt;
@@ -1080,6 +1249,9 @@ export function createNodeAgentCoordinator(options: {
 				) {
 					continue;
 				}
+				// Only the instance's owner reconciles it, so two processes'
+				// passes never both write recovery records for one row.
+				if (!(await holdInstanceOwnership(submission))) continue;
 				await withConversationWriter(submission.input, async (writer) => {
 					if (!writer) return;
 					await finalizePendingSettlement(
@@ -1141,6 +1313,7 @@ export function createNodeAgentCoordinator(options: {
 				continue;
 			}
 			try {
+				if (!(await holdInstanceOwnership(submission))) continue;
 				const replacement = await withConversationWriter(submission.input, (conversationWriter) =>
 					reconcileInterruptedSubmission(
 						submissions,
@@ -1562,6 +1735,28 @@ export function createNodeAgentCoordinator(options: {
 			}
 			stopAbortSubscription?.();
 			stopAbortSubscription = undefined;
+			if (ownerPollInterval) {
+				clearInterval(ownerPollInterval);
+				ownerPollInterval = null;
+			}
+			if (ownerExpiryTimer) {
+				clearTimeout(ownerExpiryTimer);
+				ownerExpiryTimer = null;
+			}
+			stopOwnerWakeSubscription?.();
+			stopOwnerWakeSubscription = undefined;
+			// Hand owned instances back so another process can take them at
+			// once instead of after the idle window. An instance with an
+			// abandoned attempt stays owned: its lease lapses with the attempt's.
+			const store = conversationStreamStore;
+			if (store?.releaseInstanceOwner) {
+				const busy = new Set([...activeSubmissions.values()].map((a) => a.instancePath));
+				const released = [...ownedInstances.keys()].filter((path) => !busy.has(path));
+				ownedInstances.clear();
+				await Promise.allSettled(
+					released.map((path) => store.releaseInstanceOwner?.(path, ownerId)),
+				);
+			}
 
 			if (activeSubmissions.size > 0) {
 				const abandoned = [...activeSubmissions.keys()];

@@ -680,7 +680,12 @@ export async function reconcileInterruptedSubmission(
 	//   their advisories are byte-identical and the terminal path's
 	//   idempotency check absorbs them; content can only diverge on an exact
 	//   timeout-boundary clock race. Multi-process Node makes reserve-first
-	//   MORE urgent, not less.
+	//   MORE urgent, not less. Where the conversation store offers the
+	//   instance-owner lease, the Node coordinator gates its reconcile passes
+	//   on holding it, so while every process honors the lease only one of
+	//   them reconciles an instance. That narrows the race; it does not
+	//   close it (a lease can lapse mid-pass, and stores without the lease
+	//   keep the open race), so reserve-first is still the fix.
 	// - Bounded damage: worst case is one advisory signal whose reason
 	//   disagrees with the settle record. The settle record is the outcome
 	//   authority; nothing downstream misclassifies, and (post settle

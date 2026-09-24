@@ -123,6 +123,7 @@ export type {
 	ConversationStreamMeta,
 	ConversationStreamReadResult,
 	ConversationStreamStore,
+	InstanceOwnerClaim,
 } from './runtime/conversation-stream-store.ts';
 export {
 	InMemoryConversationStreamStore,

@@ -9,6 +9,7 @@ export function createLibsqlConversationStreamStore(runner: LibsqlRunner): Conve
 		insertIgnorePrefix: 'INSERT',
 		insertIgnoreSuffix: 'ON CONFLICT (path) DO NOTHING',
 		supportsReturning: true,
+		instanceOwnerLease: true,
 		query: (sql, params) => runner.query(sql, params as LibsqlParameter[]),
 		transaction: (fn) =>
 			runner.transaction((tx) =>

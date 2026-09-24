@@ -1,6 +1,6 @@
 import type { ConversationStreamStore, SqlConversationDialectTx } from '@flue/runtime/adapter';
 import { defineSqlConversationStreamStore } from '@flue/runtime/adapter';
-import { CONVERSATION_APPEND_CHANNEL, fitsNotifyPayload } from './notify.ts';
+import { CONVERSATION_APPEND_CHANNEL, fitsNotifyPayload, OWNER_WAKE_CHANNEL } from './notify.ts';
 import type { PostgresParameter, PostgresRunner } from './postgres-adapter.ts';
 
 export function createPgConversationStreamStore(runner: PostgresRunner): ConversationStreamStore {
@@ -11,6 +11,7 @@ export function createPgConversationStreamStore(runner: PostgresRunner): Convers
 		insertIgnorePrefix: 'INSERT',
 		insertIgnoreSuffix: 'ON CONFLICT (path) DO NOTHING',
 		supportsReturning: true,
+		instanceOwnerLease: true,
 		query: (sql, params) => runner.query(sql, params as PostgresParameter[]),
 		transaction: (fn) =>
 			runner.transaction((tx) =>
@@ -26,6 +27,12 @@ export function createPgConversationStreamStore(runner: PostgresRunner): Convers
 					},
 					listenAppends: (onAppend: (path: string) => void) =>
 						listen.call(runner, CONVERSATION_APPEND_CHANNEL, onAppend),
+					async notifyOwnerWake(ownerId: string) {
+						if (!fitsNotifyPayload(ownerId)) return;
+						await runner.query('SELECT pg_notify($1, $2)', [OWNER_WAKE_CHANNEL, ownerId]);
+					},
+					listenOwnerWakes: (onWake: (ownerId: string) => void) =>
+						listen.call(runner, OWNER_WAKE_CHANNEL, onWake),
 				}
 			: {}),
 	});

@@ -252,6 +252,22 @@ async function ensureTables(runner: LibsqlRunner): Promise<void> {
 				incarnation TEXT NOT NULL
 			)
 		`);
+		// Additive, nullable instance-owner lease (the named addressee that
+		// claims the conversation's queued work). SQLite has no ADD COLUMN IF
+		// NOT EXISTS, so probe first; older runtimes ignore the columns.
+		const streamColumns = new Set(
+			(await tx.query(`PRAGMA table_info(flue_conversation_streams)`)).map((row) =>
+				String(row.name),
+			),
+		);
+		if (!streamColumns.has('owner_id')) {
+			await tx.query(`ALTER TABLE flue_conversation_streams ADD COLUMN owner_id TEXT`);
+		}
+		if (!streamColumns.has('owner_lease_expires_at')) {
+			await tx.query(
+				`ALTER TABLE flue_conversation_streams ADD COLUMN owner_lease_expires_at INTEGER`,
+			);
+		}
 		await tx.query(`
 			CREATE TABLE IF NOT EXISTS flue_conversation_stream_batches (
 				path TEXT NOT NULL,

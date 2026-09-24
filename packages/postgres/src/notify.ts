@@ -1,6 +1,9 @@
 /** `pg_notify` channel for committed conversation-stream appends (payload: path). */
 export const CONVERSATION_APPEND_CHANNEL = 'flue_conversation_append';
 
+/** `pg_notify` channel for instance-owner claim wakes (payload: owner id). */
+export const OWNER_WAKE_CHANNEL = 'flue_owner_wake';
+
 /** `pg_notify` channel for durable abort requests (payload: session key). */
 export const SUBMISSION_ABORT_CHANNEL = 'flue_submission_abort';
 

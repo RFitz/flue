@@ -33,8 +33,8 @@ import {
 	LEASE_DURATION_MS,
 	PersistedFormatVersionError,
 } from '@flue/runtime/adapter';
-import { PgAttachmentStore } from './postgres-attachment-store.ts';
 import { fitsNotifyPayload, SUBMISSION_ABORT_CHANNEL } from './notify.ts';
+import { PgAttachmentStore } from './postgres-attachment-store.ts';
 import { createPgConversationStreamStore } from './postgres-conversation-store.ts';
 
 // ─── Bring-your-own-driver runner seam ──────────────────────────────────────
@@ -244,6 +244,14 @@ async function ensureTables(runner: PostgresRunner): Promise<void> {
 				incarnation TEXT NOT NULL
 			)
 		`);
+		// Additive, nullable instance-owner lease (the named addressee that
+		// claims the conversation's queued work). Older runtimes ignore it.
+		await tx.query(
+			`ALTER TABLE flue_conversation_streams ADD COLUMN IF NOT EXISTS owner_id TEXT`,
+		);
+		await tx.query(
+			`ALTER TABLE flue_conversation_streams ADD COLUMN IF NOT EXISTS owner_lease_expires_at BIGINT`,
+		);
 		await tx.query(`
 			CREATE TABLE IF NOT EXISTS flue_conversation_stream_batches (
 				path TEXT NOT NULL,

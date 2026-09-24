@@ -25,6 +25,7 @@ export function createMysqlConversationStreamStore(runner: MysqlRunner): Convers
 		insertIgnoreSuffix: '',
 		supportsReturning: false,
 		inlineReadLimit: true,
+		instanceOwnerLease: true,
 		validatePath: assertMysqlConversationStreamPath,
 		query: (sql, params) => runner.query(sql, params as MysqlParameter[]),
 		transaction: (fn) =>

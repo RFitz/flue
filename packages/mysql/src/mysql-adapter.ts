@@ -99,6 +99,8 @@ const schemaTables = {
 		'producer_epoch',
 		'next_producer_sequence',
 		'incarnation',
+		'owner_id',
+		'owner_lease_expires_at',
 	],
 	flue_conversation_stream_batches: [
 		'path',
@@ -342,6 +344,23 @@ async function ensureTables(runner: MysqlRunner): Promise<void> {
 		`CREATE TABLE IF NOT EXISTS flue_conversation_fold_checkpoints (path VARCHAR(${MYSQL_CONVERSATION_STREAM_PATH_LIMIT}) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin PRIMARY KEY, head_offset VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, incarnation VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, format_version BIGINT NOT NULL, data LONGTEXT NOT NULL) ENGINE=InnoDB`,
 	];
 	for (const statement of ddl) await runner.query(statement);
+	// Additive, nullable instance-owner lease (the named addressee that claims
+	// the conversation's queued work). MySQL has no ADD COLUMN IF NOT EXISTS,
+	// so probe first; older runtimes ignore the columns.
+	const ownerColumns = await runner.query(
+		`SELECT COLUMN_NAME AS column_name FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'flue_conversation_streams' AND COLUMN_NAME IN ('owner_id', 'owner_lease_expires_at')`,
+	);
+	const presentOwnerColumns = new Set(ownerColumns.map((row) => String(row.column_name)));
+	if (!presentOwnerColumns.has('owner_id')) {
+		await runner.query(
+			`ALTER TABLE flue_conversation_streams ADD COLUMN owner_id VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL`,
+		);
+	}
+	if (!presentOwnerColumns.has('owner_lease_expires_at')) {
+		await runner.query(
+			`ALTER TABLE flue_conversation_streams ADD COLUMN owner_lease_expires_at BIGINT NULL`,
+		);
+	}
 	const tables = await runner.query(
 		`SELECT TABLE_NAME AS table_name, ENGINE AS engine FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE 'flue\\_%'`,
 	);

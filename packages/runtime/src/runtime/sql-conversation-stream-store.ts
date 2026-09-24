@@ -9,6 +9,7 @@ import {
 	type ConversationStreamMeta,
 	type ConversationStreamReadResult,
 	type ConversationStreamStore,
+	type InstanceOwnerClaim,
 	StreamListenerRegistry,
 } from './conversation-stream-store.ts';
 import { generateIncarnationId } from './ids.ts';
@@ -59,6 +60,16 @@ export interface SqlConversationDialect {
 	 * readers fall back to their poll timeouts.
 	 */
 	listenAppends?(onAppend: (path: string) => void): Promise<unknown>;
+	/**
+	 * Whether the streams table carries the nullable `owner_id` /
+	 * `owner_lease_expires_at` columns. Only then does the store offer the
+	 * instance-owner lease; a schema without them keeps claiming an open race.
+	 */
+	readonly instanceOwnerLease?: boolean;
+	/** Ask the process running as `ownerId` to run a claim pass (Postgres: `pg_notify`). */
+	notifyOwnerWake?(ownerId: string): Promise<void>;
+	/** Deliver other processes' owner wakes for the life of the store. */
+	listenOwnerWakes?(onWake: (ownerId: string) => void): Promise<unknown>;
 }
 
 /**
@@ -77,8 +88,89 @@ export function defineSqlConversationStreamStore(
 class SqlConversationStreamStore implements ConversationStreamStore {
 	private listeners = new StreamListenerRegistry();
 	private remoteAppends: Promise<unknown> | undefined;
+	private ownerWakeListeners = new StreamListenerRegistry();
+	private remoteOwnerWakes: Promise<unknown> | undefined;
 
-	constructor(private dialect: SqlConversationDialect) {}
+	readonly claimInstanceOwner?: ConversationStreamStore['claimInstanceOwner'];
+	readonly releaseInstanceOwner?: ConversationStreamStore['releaseInstanceOwner'];
+	readonly wakeInstanceOwner?: ConversationStreamStore['wakeInstanceOwner'];
+	readonly subscribeOwnerWakes?: ConversationStreamStore['subscribeOwnerWakes'];
+
+	constructor(private dialect: SqlConversationDialect) {
+		if (dialect.instanceOwnerLease) {
+			this.claimInstanceOwner = (path, ownerId, lease) =>
+				this.claimOwner(path, ownerId, lease);
+			this.releaseInstanceOwner = (path, ownerId) => this.releaseOwner(path, ownerId);
+			const { notifyOwnerWake, listenOwnerWakes } = dialect;
+			if (notifyOwnerWake && listenOwnerWakes) {
+				this.wakeInstanceOwner = (ownerId) => notifyOwnerWake.call(dialect, ownerId);
+				this.subscribeOwnerWakes = (ownerId, onWake) => {
+					this.listenForRemoteOwnerWakes();
+					return this.ownerWakeListeners.subscribe(ownerId, onWake);
+				};
+			}
+		}
+	}
+
+	/**
+	 * The conditional UPDATE is the whole CAS — atomic on every dialect
+	 * without a row lock — and the read-back inside the same transaction
+	 * reports whoever holds the lease after it.
+	 */
+	private async claimOwner(
+		path: string,
+		ownerId: string,
+		lease: { now: number; leaseExpiresAt: number },
+	): Promise<InstanceOwnerClaim> {
+		const dialect = this.dialect;
+		const p = (index: number) => dialect.placeholder(index);
+		dialect.validatePath?.(path, 'claim_instance_owner');
+		return dialect.transaction(async (tx) => {
+			await tx.query(
+				`UPDATE flue_conversation_streams
+				 SET owner_id = ${p(1)}, owner_lease_expires_at = ${p(2)}
+				 WHERE path = ${p(3)} AND (owner_id IS NULL OR owner_id = ${p(4)}
+				   OR owner_lease_expires_at IS NULL OR owner_lease_expires_at <= ${p(5)})`,
+				[ownerId, lease.leaseExpiresAt, path, ownerId, lease.now],
+			);
+			const rows = await tx.query(
+				`SELECT owner_id, owner_lease_expires_at FROM flue_conversation_streams WHERE path = ${p(1)}`,
+				[path],
+			);
+			const row = rows[0];
+			if (!row || row.owner_id === ownerId) {
+				return { owned: true, leaseExpiresAt: lease.leaseExpiresAt };
+			}
+			return {
+				owned: false,
+				ownerId: String(row.owner_id),
+				leaseExpiresAt: Number(row.owner_lease_expires_at),
+			};
+		});
+	}
+
+	private async releaseOwner(path: string, ownerId: string): Promise<void> {
+		const dialect = this.dialect;
+		const p = (index: number) => dialect.placeholder(index);
+		dialect.validatePath?.(path, 'release_instance_owner');
+		await dialect.query(
+			`UPDATE flue_conversation_streams SET owner_id = NULL, owner_lease_expires_at = NULL
+			 WHERE path = ${p(1)} AND owner_id = ${p(2)}`,
+			[path, ownerId],
+		);
+	}
+
+	/** Relay other processes' owner wakes into the local registry (see appends). */
+	private listenForRemoteOwnerWakes(): void {
+		const listen = this.dialect.listenOwnerWakes;
+		if (!listen || this.remoteOwnerWakes) return;
+		this.remoteOwnerWakes = listen
+			.call(this.dialect, (ownerId) => this.ownerWakeListeners.notify(ownerId))
+			.catch((error: unknown) => {
+				console.error('[flue:conversation-stream] Could not listen for owner wakes:', error);
+				this.remoteOwnerWakes = undefined;
+			});
+	}
 
 	async createStream(path: string, identity: ConversationStreamIdentity): Promise<void> {
 		const dialect = this.dialect;

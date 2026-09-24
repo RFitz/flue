@@ -42,6 +42,15 @@ export interface ConversationStreamMeta {
 }
 
 /**
+ * Outcome of {@link ConversationStreamStore.claimInstanceOwner}. `owned` means
+ * the caller holds the instance's owner lease until `leaseExpiresAt`;
+ * otherwise `ownerId` holds it until then.
+ */
+export type InstanceOwnerClaim =
+	| { readonly owned: true; readonly leaseExpiresAt: number }
+	| { readonly owned: false; readonly ownerId: string; readonly leaseExpiresAt: number };
+
+/**
  * A durable fold checkpoint: the serialized reduced state of one stream at a
  * batch offset (conversation-fold-checkpoint.ts). Strictly a cache over the
  * log — never authoritative, safe to discard, rebuilt by replay when absent.
@@ -119,6 +128,32 @@ export interface ConversationStreamStore {
 		path: string,
 		options?: { atOrBefore?: string },
 	): Promise<ConversationFoldCheckpoint | null>;
+	/**
+	 * Optional instance-owner lease (presence-checked): the named addressee
+	 * that may claim this conversation's queued work. Take or renew the lease
+	 * for `ownerId` until `leaseExpiresAt` when it is free, already held by
+	 * `ownerId`, or expired as of `now`; otherwise report the holder. A path
+	 * with no stream reports `owned` (there is nothing to address yet).
+	 *
+	 * Layered above the submission lease and the producer epoch, which stay
+	 * the fencing authority: the owner lease only decides WHICH process
+	 * claims, never whether a claimed attempt may write. Stores without it
+	 * leave claiming an open race among processes.
+	 */
+	claimInstanceOwner?(
+		path: string,
+		ownerId: string,
+		lease: { now: number; leaseExpiresAt: number },
+	): Promise<InstanceOwnerClaim>;
+	/** Drop `ownerId`'s owner lease on `path`, if it still holds it. */
+	releaseInstanceOwner?(path: string, ownerId: string): Promise<void>;
+	/**
+	 * Optional owner wake pair: ask the process running as `ownerId` to run a
+	 * claim pass now (work for an instance it owns was admitted elsewhere).
+	 * Signals may be lost; owners without a subscription poll instead.
+	 */
+	wakeInstanceOwner?(ownerId: string): Promise<void>;
+	subscribeOwnerWakes?(ownerId: string, onWake: () => void): () => void;
 }
 
 const CREATE_STREAMS_TABLE = `
@@ -283,6 +318,7 @@ interface InMemoryConversationBatch extends ConversationStreamBatch {
 }
 
 interface InMemoryConversationStream {
+	owner?: { ownerId: string; leaseExpiresAt: number };
 	identity: ConversationStreamIdentity;
 	incarnation: string;
 	producerId: string | null;
@@ -324,6 +360,26 @@ export class InMemoryConversationStreamStore implements ConversationStreamStore 
 			nextProducerSequence: 0,
 			batches: [],
 		});
+	}
+
+	async claimInstanceOwner(
+		path: string,
+		ownerId: string,
+		lease: { now: number; leaseExpiresAt: number },
+	): Promise<InstanceOwnerClaim> {
+		const stream = this.streams.get(path);
+		if (!stream) return { owned: true, leaseExpiresAt: lease.leaseExpiresAt };
+		const holder = stream.owner;
+		if (holder && holder.ownerId !== ownerId && holder.leaseExpiresAt > lease.now) {
+			return { owned: false, ownerId: holder.ownerId, leaseExpiresAt: holder.leaseExpiresAt };
+		}
+		stream.owner = { ownerId, leaseExpiresAt: lease.leaseExpiresAt };
+		return { owned: true, leaseExpiresAt: lease.leaseExpiresAt };
+	}
+
+	async releaseInstanceOwner(path: string, ownerId: string): Promise<void> {
+		const stream = this.streams.get(path);
+		if (stream?.owner?.ownerId === ownerId) stream.owner = undefined;
 	}
 
 	async acquireProducer(path: string, producerId: string): Promise<ConversationProducerClaim> {

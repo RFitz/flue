@@ -716,5 +716,93 @@ export function defineConversationStreamStoreContractTests(
 				await stream.getFoldCheckpoint('agents/echo/contract', { atOrBefore: second.offset }),
 			).toMatchObject({ offset: second.offset });
 		});
+
+		// ─── Optional instance-owner lease ──────────────────────────────────
+		// Backends without claimInstanceOwner skip these: claiming stays an
+		// open race among processes, fenced by submission leases.
+
+		it('grants the owner lease to one owner at a time until it lapses when supported', async () => {
+			const { stream } = await create();
+			if (!stream.claimInstanceOwner) return;
+			const path = 'agents/echo/contract';
+			await stream.createStream(path, { agentName: 'echo', instanceId: 'contract' });
+			const now = 1_000_000;
+
+			expect(
+				await stream.claimInstanceOwner(path, 'owner_a', { now, leaseExpiresAt: now + 30_000 }),
+			).toEqual({ owned: true, leaseExpiresAt: now + 30_000 });
+			expect(
+				await stream.claimInstanceOwner(path, 'owner_b', {
+					now: now + 1,
+					leaseExpiresAt: now + 30_001,
+				}),
+			).toEqual({ owned: false, ownerId: 'owner_a', leaseExpiresAt: now + 30_000 });
+			// The holder renews its own lease.
+			expect(
+				await stream.claimInstanceOwner(path, 'owner_a', {
+					now: now + 10_000,
+					leaseExpiresAt: now + 40_000,
+				}),
+			).toEqual({ owned: true, leaseExpiresAt: now + 40_000 });
+			// Once the lease lapses, any owner may take it.
+			expect(
+				await stream.claimInstanceOwner(path, 'owner_b', {
+					now: now + 40_000,
+					leaseExpiresAt: now + 70_000,
+				}),
+			).toEqual({ owned: true, leaseExpiresAt: now + 70_000 });
+			expect(
+				await stream.claimInstanceOwner(path, 'owner_a', {
+					now: now + 40_001,
+					leaseExpiresAt: now + 70_001,
+				}),
+			).toEqual({ owned: false, ownerId: 'owner_b', leaseExpiresAt: now + 70_000 });
+		});
+
+		it('frees the owner lease on release by its holder only when supported', async () => {
+			const { stream } = await create();
+			if (!stream.claimInstanceOwner || !stream.releaseInstanceOwner) return;
+			const path = 'agents/echo/contract';
+			await stream.createStream(path, { agentName: 'echo', instanceId: 'contract' });
+			const now = 1_000_000;
+			await stream.claimInstanceOwner(path, 'owner_a', { now, leaseExpiresAt: now + 30_000 });
+
+			await stream.releaseInstanceOwner(path, 'owner_b');
+			expect(
+				await stream.claimInstanceOwner(path, 'owner_b', { now, leaseExpiresAt: now + 30_000 }),
+			).toMatchObject({ owned: false, ownerId: 'owner_a' });
+
+			await stream.releaseInstanceOwner(path, 'owner_a');
+			expect(
+				await stream.claimInstanceOwner(path, 'owner_b', { now, leaseExpiresAt: now + 30_000 }),
+			).toEqual({ owned: true, leaseExpiresAt: now + 30_000 });
+		});
+
+		it('leaves the owner lease untouched by reads and producer churn when supported', async () => {
+			const { stream } = await create();
+			if (!stream.claimInstanceOwner) return;
+			const path = 'agents/echo/contract';
+			await stream.createStream(path, { agentName: 'echo', instanceId: 'contract' });
+			const now = 1_000_000;
+			await stream.claimInstanceOwner(path, 'owner_a', { now, leaseExpiresAt: now + 30_000 });
+			const producer = await stream.acquireProducer(path, 'owner_b');
+			await stream.append({
+				path,
+				producerId: producer.producerId,
+				producerEpoch: producer.producerEpoch,
+				incarnation: producer.incarnation,
+				producerSequence: 0,
+				records: [userRecord('record_1', 'entry_1')],
+			});
+			await stream.read(path);
+			await stream.getMeta(path);
+
+			expect(
+				await stream.claimInstanceOwner(path, 'owner_b', {
+					now: now + 1,
+					leaseExpiresAt: now + 30_001,
+				}),
+			).toEqual({ owned: false, ownerId: 'owner_a', leaseExpiresAt: now + 30_000 });
+		});
 	});
 }

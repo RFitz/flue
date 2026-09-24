@@ -141,9 +141,9 @@ export class ConversationFoldHost {
 
 /**
  * Cap on cached folds without a live writer. Writer-pinned hosts are exempt
- * (Node already keeps one writer per touched path for the process lifetime);
- * the cap bounds read-only paths in many-instance processes. An evicted host
- * costs one from-scratch replay on the next read.
+ * while their writer lives (on Node, one claimed attempt or recovery settle);
+ * the cap bounds released and read-only paths in many-instance processes. An
+ * evicted host costs one from-scratch replay on the next read.
  */
 const MAX_IDLE_HOSTS = 64;
 

@@ -667,15 +667,20 @@ export async function reconcileInterruptedSubmission(
 	//   admits both until the settlement CAS lands). A zombie that wakes
 	//   inside that window can interleave writes with the terminal records;
 	//   first-terminal-wins and the idempotent terminal path bound the
-	//   damage to stray timeline entries. The Node coordinator closes that
-	//   window: its force path acquires a fresh stream producer before
-	//   settling, so the zombie's writer fails on the producer epoch.
-	// - Narrow even if raced: racing reconcilers derive the reason from the
-	//   same durable row facts, so their advisories are byte-identical and
-	//   the terminal path's idempotency check absorbs the race; content can
-	//   only diverge on an exact timeout-boundary clock race. A second
-	//   PROCESS must also win the stream's producer claim to write anything,
-	//   which fences the other process out of the stream entirely.
+	//   damage to stray timeline entries. On Node the in-process force path
+	//   acquires a fresh stream producer before settling, so that one
+	//   zombie's writer fails on the producer epoch — this closes only the
+	//   in-process window, not the cross-process one below.
+	// - Racing reconcilers are NO LONGER bounded by the producer claim. The
+	//   Node coordinator acquires a fresh producer per claim and per
+	//   reconcile by design, so two processes' expired-lease scans reaching
+	//   the same row each acquire (each fencing the other) and each append
+	//   an advisory before one settlement CAS wins. What still bounds the
+	//   damage: both derive the reason from the same durable row facts, so
+	//   their advisories are byte-identical and the terminal path's
+	//   idempotency check absorbs them; content can only diverge on an exact
+	//   timeout-boundary clock race. Multi-process Node makes reserve-first
+	//   MORE urgent, not less.
 	// - Bounded damage: worst case is one advisory signal whose reason
 	//   disagrees with the settle record. The settle record is the outcome
 	//   authority; nothing downstream misclassifies, and (post settle

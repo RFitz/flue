@@ -458,16 +458,19 @@ export function createNodeAgentCoordinator(options: {
 				conversationWriter,
 				emitCoordinatorEvent,
 				signal: controller.signal,
-				// A lost lease unwinds like shutdown: the row belongs to its new
-				// owner, so this task must not settle it.
-				isShutdownAbort: (error) =>
-					entry.leaseLost ||
-					(stopping && error instanceof DOMException && error.name === 'AbortError'),
+				// The abort a lost lease fires unwinds like shutdown: the row
+				// belongs to its new owner, so this task must not settle it. Only
+				// that AbortError is exempt — any other error after the loss
+				// (e.g. a settle failure once the database is back) takes the
+				// normal path, so the settlement ledger stays the authority and a
+				// reserved `terminalizing` row is never stranded by a stale flag.
+				isShutdownAbort: (error) => (entry.leaseLost || stopping) && isAbortError(error),
 			});
 		})()
 			.catch((error) => {
-				// AbortErrors during shutdown are expected — don't log them.
-				if (error instanceof DOMException && error.name === 'AbortError') return;
+				// AbortErrors during shutdown or after a lost lease are expected —
+				// don't log them.
+				if (isAbortError(error)) return;
 				console.error(
 					'[flue:submission-processing]',
 					{
@@ -726,6 +729,9 @@ export function createNodeAgentCoordinator(options: {
 	}
 
 	function stopLostAttempt(submissionId: string, active: ActiveSubmission): void {
+		// Identity guard: a replacement attempt in this process (a reclaim
+		// through the reconcile pass) holds a different entry for the same id,
+		// so a stale renewal verdict can never stop it.
 		if (active.leaseLost || activeSubmissions.get(submissionId) !== active) return;
 		active.leaseLost = true;
 		console.error('[flue:lease-heartbeat]', {
@@ -748,6 +754,11 @@ export function createNodeAgentCoordinator(options: {
 	 * attempt live in another process learns of the durable intent here. A
 	 * store that pushes abort requests reaches it at once; otherwise poll
 	 * the live attempts' rows. The deadline scan remains the backstop.
+	 *
+	 * The two paths are not symmetric: a pushed request aborts every live
+	 * attempt on the session at once, while the poll aborts only attempts
+	 * whose row is still `running` with an intent stamped, and waits up to
+	 * one poll period. Both settle through the same aborted path.
 	 */
 	function watchAbortRequests(): void {
 		if (stopAbortSubscription || abortPollInterval) return;
@@ -1575,4 +1586,8 @@ export function createNodeAgentCoordinator(options: {
 			await Promise.allSettled(mcpCaches.map((cache) => cache.close()));
 		},
 	};
+}
+
+function isAbortError(error: unknown): boolean {
+	return error instanceof DOMException && error.name === 'AbortError';
 }

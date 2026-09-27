@@ -62,7 +62,7 @@ on this branch:
 |---|---|---|
 | **Q3** | Instance lease **subsume** vs **layer** on submission lease | Layered chosen as smaller additive; subsume deferred |
 | **Q4** | Wake capability optional vs required | Still optional (attempt + owner wake) |
-| **Q5** | Placement public API | Not started; only TTL knob (`ownership.idleTtlMs` / `FLUE_OWNER_IDLE_TTL_MS`) |
+| **Q5** | Placement public API | Not started; only TTL knob (`ownership.idleTtlMs` / `FLUE_OWNER_IDLE_TTL_MS`). Topology (API vs claim-loop containers) is in `API-LOOP-DECOUPLING.md` |
 | **Q6** | Phase 0 vs 1h ordering | Phase 0 still needed; attempt largely superseded 1h |
 
 ### 5. Known operational risks (not blockers for review)
@@ -90,3 +90,7 @@ on this branch:
 - Dual-coordinator tests: `packages/postgres/src/multi-process.test.ts`.
 - Owner lease store wiring: SQL conversation stream store + dialect opt-in
   `instanceOwnerLease`.
+- **API vs agent-loop containers:** `API-LOOP-DECOUPLING.md`. Mailbox + owner
+  lease allow API replicas that only admit/read, but the generated Node server
+  still co-locates HTTP and the claim loop in one process. No `role` /
+  `apiOnly` / `workerOnly` flag on this branch.
